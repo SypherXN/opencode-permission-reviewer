@@ -217,6 +217,11 @@ unnecessary escalations, so compare both safety errors and format validity.
 Higher reasoning variants may cost more or take longer without always improving
 the result.
 
+Free OpenCode Zen models (for example `opencode/big-pickle` or the `*-free`
+IDs) cannot be used as the reviewer: Zen only serves its free tier to OpenCode's
+own clients and rejects the sessions the plugin creates, so every review falls
+back to a manual prompt. Use a paid or subscription model instead.
+
 ### Jev System One reviewer
 
 Set `model` in the trusted global `~/.config/opencode/permission-reviewer.jsonc`
