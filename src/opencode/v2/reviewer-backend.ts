@@ -16,7 +16,7 @@ import { buildReviewerPrompt, DEFAULT_TENANT_POLICY, REVIEWER_SYSTEM_PROMPT } fr
 import { enforceDecision, parseDecision, parseDecisionFromText } from "../../decision.ts"
 import { applyEscalationDisposition } from "../../escalation.ts"
 import { formatFailureReason } from "../../failure-reason.ts"
-import { splitModel } from "../../config.ts"
+import { DEFAULT_CONFIG, splitModel } from "../../config.ts"
 import { createIsolatedLocation } from "./isolated-location.ts"
 
 type Context = Parameters<Plugin.Plugin["setup"]>[0]
@@ -236,12 +236,10 @@ export class V2ReviewerBackend {
         (item) => item.providerID === providerID && item.id === modelID,
       )
       if (!model) throw new Error("Reviewer model is unavailable")
-      if (
-        this.config.variant &&
-        !model.variants?.some((variant) => variant.id === this.config.variant)
-      ) {
-        throw new Error("Reviewer variant is unavailable")
-      }
+      const variant = selectVariant(
+        this.config.variant,
+        (model.variants ?? []).map((item) => item.id),
+      )
       if (this.config.outputFormat === "json_schema" && !model.capabilities.tools) {
         throw new Error("Reviewer model does not support structured tool output")
       }
@@ -269,7 +267,7 @@ export class V2ReviewerBackend {
             model: {
               id: modelID,
               providerID,
-              ...(this.config.variant ? { variant: this.config.variant } : {}),
+              ...(variant ? { variant } : {}),
             },
             permissions: [
               { action: "*", resource: "*", effect: "deny" },
@@ -456,4 +454,19 @@ async function waitForIsolationActive(
       if (signal.aborted) onAbort()
     })
   }
+}
+
+/** Picks the reviewer variant to request from the host catalog. The built-in
+ *  default is only a preference: models that do not offer it run with their
+ *  own default instead of failing every review. An explicitly configured
+ *  variant the model does not offer still fails closed. */
+export function selectVariant(configured: string, available: string[]): string | undefined {
+  if (!configured || available.includes(configured)) return configured || undefined
+  if (configured === DEFAULT_CONFIG.variant) return undefined
+  throw new Error(
+    `Reviewer variant "${configured}" is unavailable` +
+      (available.length > 0
+        ? ` (model offers: ${available.join(", ")})`
+        : " (model has no variants)"),
+  )
 }

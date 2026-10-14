@@ -200,7 +200,9 @@ The model options are:
 - **`model`**: in `provider/model` form. Chat models must match a configured
   OpenCode provider; supported Jev IDs use the direct System One API below.
 - **`variant`**: reasoning effort the model supports (`max`, `high`, `medium`,
-  `low`, `none`). Passed straight through to OpenCode.
+  `low`, `none`). Passed straight through to OpenCode. On V2, when the model
+  does not offer the default `medium`, the review uses the model's own default;
+  any other variant the model does not offer fails closed to a manual prompt.
 - **`outputFormat`**: how the reviewer returns its decision: `json_schema`
   (default; uses OpenCode's structured output, needs provider support) or
   `text` (ask the model to emit JSON in plain text and parse it locally). Use
