@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.3] - 2026-10-14
+
+### Fixed
+
+- On OpenCode V2, run reviews with the model's own default when the reviewer
+  model does not offer the built-in `medium` variant. Models without variants,
+  such as `opencode-go/mimo-v2.6-flash`, previously made every review fail
+  closed. An explicitly configured variant the model lacks still fails closed,
+  and the reason now lists the variants the model offers.
+
+### Changed
+
+- Bumped the `@opencode/client` runtime dependency to 2.0.28, which moves
+  `effect` from 4.0.0-rc.112 to the stable 4.0.1.
+- Verified with OpenCode V1 1.19.0 and V2 2.0.28.
+- Documented that free OpenCode Zen models cannot act as the reviewer: Zen
+  rejects the sessions the plugin creates, so every review falls back to a
+  manual prompt.
+
 ## [2.4.2] - 2026-10-10
 
 ### Fixed

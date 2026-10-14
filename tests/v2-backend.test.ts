@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url"
 import type { OpenCodeClient } from "@opencode/client"
 import type { Plugin } from "@opencode/plugin"
 import { V2ReviewerBackend } from "../src/opencode/v2/reviewer-backend.ts"
+import { DEFAULT_CONFIG } from "../src/config.ts"
 import { ReviewAttempt } from "../src/core/review-attempt.ts"
 import type { ReviewEnvelope, ReviewerConfig } from "../src/types.ts"
 import { config, decision, request } from "./helpers.ts"
@@ -32,6 +33,7 @@ function fixture(
     missingModel?: boolean
     noTools?: boolean
     variant?: string
+    modelVariants?: string[]
     retain?: boolean
     wrongLocation?: boolean
     activationFailed?: boolean
@@ -46,6 +48,7 @@ function fixture(
   let contextHook!: (event: ContextEvent) => void
   let toolHook!: (event: { sessionID: string; tool: string }) => void
   let directory = ""
+  let requestedVariant: string | undefined
   const directories: string[] = []
   const activated = new Set<string>()
   let sessionID = ""
@@ -158,7 +161,7 @@ function fixture(
                 providerID: "fixture",
                 id: "reviewer",
                 capabilities: { tools: !options.noTools },
-                variants: [{ id: "max" }],
+                variants: (options.modelVariants ?? ["max"]).map((id) => ({ id })),
               },
             ],
       }),
@@ -190,9 +193,11 @@ function fixture(
       create: async (input: {
         id: string
         location: { directory: string }
+        model: { variant?: string }
         permissions: unknown[]
       }) => {
         sessionID = input.id
+        requestedVariant = input.model.variant
         sessionIDs.push(sessionID)
         expect(input.permissions[0]).toEqual({ action: "*", resource: "*", effect: "deny" })
         return {
@@ -296,6 +301,7 @@ function fixture(
       sessionID,
       sessionIDs,
       removed: removed.has(sessionID),
+      requestedVariant,
       messagesBySession,
       prompts,
       mcpLists,
@@ -458,6 +464,38 @@ test("unavailable model, unsupported format or variant, and wrong isolation fail
     } finally {
       await harness.cleanup()
     }
+  }
+})
+
+test("the default variant falls back to the model default when the model lacks it", async () => {
+  for (const modelVariants of [[], ["low", "high"]]) {
+    const harness = fixture({ variant: DEFAULT_CONFIG.variant, modelVariants })
+    try {
+      expect((await harness.run()).kind).toBe("allow")
+      expect(harness.state().prompts).toBe(1)
+      expect(harness.state().requestedVariant).toBeUndefined()
+    } finally {
+      await harness.cleanup()
+    }
+  }
+  const offered = fixture({ variant: DEFAULT_CONFIG.variant, modelVariants: ["medium", "high"] })
+  try {
+    expect((await offered.run()).kind).toBe("allow")
+    expect(offered.state().requestedVariant).toBe(DEFAULT_CONFIG.variant)
+  } finally {
+    await offered.cleanup()
+  }
+})
+
+test("an explicit variant the model lacks fails closed with the offered variants", async () => {
+  const harness = fixture({ variant: "max", modelVariants: ["low", "high"] })
+  try {
+    const result = await harness.run()
+    expect(result.kind).toBe("escalate")
+    expect(result.reason).toContain('variant "max" is unavailable (model offers: low, high)')
+    expect(harness.state().prompts).toBe(0)
+  } finally {
+    await harness.cleanup()
   }
 })
 

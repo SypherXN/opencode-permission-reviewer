@@ -8,10 +8,12 @@ export OPENCODE_V1_1_18_29=/absolute/path/to/opencode-1.18.29
 export OPENCODE_V1_1_18_30=/absolute/path/to/opencode-1.18.30
 export OPENCODE_V1_1_18_31=/absolute/path/to/opencode-1.18.31
 export OPENCODE_V1_1_18_32=/absolute/path/to/opencode-1.18.32
+export OPENCODE_V1_1_19_0=/absolute/path/to/opencode-1.19.0
 export OPENCODE_V2_2_0_3=/absolute/path/to/opencode-2.0.3
 export OPENCODE_V2_2_0_11=/absolute/path/to/opencode-2.0.11
 export OPENCODE_V2_2_0_15=/absolute/path/to/opencode-2.0.15
 export OPENCODE_V2_2_0_18=/absolute/path/to/opencode-2.0.18
+export OPENCODE_V2_2_0_28=/absolute/path/to/opencode-2.0.28
 python -m pytest tests/compatibility -q
 ```
 

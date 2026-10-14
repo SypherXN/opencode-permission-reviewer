@@ -15,7 +15,7 @@ CASES = [(generation, version)
          if os.environ.get("HOST_GENERATION", generation) == generation
          for version in ([os.environ[f"{generation.upper()}_HOST_VERSION"]]
                          if os.environ.get(f"{generation.upper()}_HOST_VERSION")
-                         else (["1.18.29", "1.18.32"] if generation == "v1" else ["2.0.3", "2.0.20"]))]
+                         else (["1.18.29", "1.19.0"] if generation == "v1" else ["2.0.3", "2.0.28"]))]
 
 
 @pytest.mark.parametrize("generation,version", CASES)

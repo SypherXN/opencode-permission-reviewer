@@ -16,7 +16,7 @@ import pytest
 V1_VERSIONS = (
     [os.environ["V1_HOST_VERSION"]]
     if os.environ.get("V1_HOST_VERSION")
-    else ["1.18.29", "1.18.30", "1.18.31", "1.18.32"]
+    else ["1.18.29", "1.18.30", "1.18.31", "1.18.32", "1.19.0"]
 )
 
 @pytest.mark.parametrize("version", V1_VERSIONS)

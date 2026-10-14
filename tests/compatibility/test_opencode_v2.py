@@ -13,7 +13,7 @@ import pytest
 V2_VERSIONS = (
     [os.environ["V2_HOST_VERSION"]]
     if os.environ.get("V2_HOST_VERSION")
-    else ["2.0.3", "2.0.11", "2.0.15", "2.0.18"]
+    else ["2.0.3", "2.0.11", "2.0.15", "2.0.18", "2.0.28"]
 )
 
 
@@ -27,7 +27,7 @@ def test_v2_isolated_server(launch_host, activate_host, probe_package, host_vers
     assert (host["project"] / "host-probe.txt").read_text() == f"setup:v2:{host_version}\n"
     capabilities = json.loads((host["project"] / "host-capabilities.json").read_text())
     assert capabilities == {
-        "sessionRemove": False,
+        "sessionRemove": tuple(map(int, host_version.split("."))) >= (2, 0, 28),
         "sessionGenerate": True,
         "generateText": True,
         "generateKeys": ["text"],
