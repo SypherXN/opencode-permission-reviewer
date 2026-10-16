@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Bumped the `@opencode/client` runtime dependency to 2.0.29.
+
 ## [2.4.3] - 2026-10-14
 
 ### Fixed
