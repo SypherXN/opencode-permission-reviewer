@@ -52,6 +52,13 @@ tests, alongside its matching executable variable. For example,
 `V1_HOST_VERSION=1.18.34` uses `OPENCODE_V1_1_18_34` without changing the
 pinned matrix.
 
+The `host compatibility advisory` workflow runs daily. It reports registry
+releases newer than the reference and runs the functional suites against the
+current `latest` host of each generation (`HOST_RELEASE=latest
+bun tests/compatibility/install-hosts.ts`). That host is unpinned, so the
+workflow is advisory and never gates merges; a failure means the next host
+bump needs work before it is pinned.
+
 The V2 server and TUI compile against the minimum supported plugin SDK while
 the real-host matrix exercises the pinned host binaries.
 
