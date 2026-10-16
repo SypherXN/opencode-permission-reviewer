@@ -481,4 +481,67 @@ describe("config loader — trust boundary", () => {
       rmSync(dir, { recursive: true })
     }
   })
+
+  test("project and unknown inline config cannot grant module routing", () => {
+    const dir = mkdtempSync(join(tmpdir(), "reviewer-cfg-"))
+    try {
+      mkdirSync(join(dir, ".opencode"), { recursive: true })
+      writeFileSync(
+        projectConfigPath(dir),
+        JSON.stringify({
+          moduleRouting: {
+            enabled: true,
+            module: "opr-jev",
+            allowPaid: true,
+            models: ["opencode/jev-1.13"],
+          },
+        }),
+      )
+      expect(loadResolvedConfig(undefined, dir).moduleRouting).toBeUndefined()
+      const trusted = loadResolvedConfig(
+        {
+          moduleRouting: {
+            enabled: true,
+            module: "opr-jev",
+            allowPaid: false,
+            models: ["opencode/jev-1.13-free"],
+          },
+        },
+        dir,
+      )
+      expect(trusted.moduleRouting).toEqual({
+        module: "opr-jev",
+        allowPaid: false,
+        models: [{ providerID: "opencode", modelID: "jev-1.13-free" }],
+      })
+      const unknown = loadResolvedConfig(
+        {
+          moduleRouting: {
+            enabled: true,
+            module: "opr-jev",
+            allowPaid: true,
+            models: ["opencode/jev-1.13"],
+          },
+        },
+        undefined,
+        "unknown",
+      )
+      expect(unknown.moduleRouting).toBeUndefined()
+      expect(unknown.moduleRoutingRejected).toBeUndefined()
+    } finally {
+      rmSync(dir, { recursive: true })
+    }
+  })
+
+  test("invalid global module routing is degraded and does not select a model", () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ moduleRouting: { enabled: true } }))
+    try {
+      const loaded = loadResolvedConfig(undefined)
+      expect(loaded.moduleRouting).toBeUndefined()
+      expect(loaded.moduleRoutingRejected).toBe(true)
+      expect(loaded.configDegraded?.join(" ")).toContain("moduleRouting")
+    } finally {
+      rmSync(globalConfigPath(), { force: true })
+    }
+  })
 })

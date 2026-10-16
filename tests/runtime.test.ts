@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, test } from "bun:test"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { execFile } from "node:child_process"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { promisify } from "node:util"
 import { REVIEWER_SYSTEM_PROMPT } from "../src/policy.ts"
@@ -168,7 +169,7 @@ describe("runtime decisions", () => {
   })
 
   test("leaves sensitive but existing remote stdin decisions to Luna", async () => {
-    const directory = await mkdtemp("/tmp/opencode/approval-reviewer-sensitive-")
+    const directory = await mkdtemp(join(tmpdir(), "approval-reviewer-sensitive-"))
     const script = `${directory}/script.py`
     // Synthetic credential assembled by concatenation so no continuous
     // secret-shaped literal appears in source (see AGENTS.md).
@@ -193,7 +194,7 @@ describe("runtime decisions", () => {
   })
 
   test("includes bounded local script semantics in Luna's prompt without deciding locally", async () => {
-    const directory = await mkdtemp("/tmp/opencode/approval-reviewer-runtime-script-")
+    const directory = await mkdtemp(join(tmpdir(), "approval-reviewer-runtime-script-"))
     const script = join(directory, "consolidate.py")
     await writeFile(script, 'from pathlib import Path\nPath("guide.md").write_text("updated")\n')
     try {
@@ -218,7 +219,7 @@ describe("runtime decisions", () => {
   })
 
   test("includes bun run target semantics in Luna's prompt", async () => {
-    const directory = await mkdtemp("/tmp/opencode/approval-reviewer-runtime-bun-run-")
+    const directory = await mkdtemp(join(tmpdir(), "approval-reviewer-runtime-bun-run-"))
     const script = join(directory, "runner.ts")
     await writeFile(script, 'const key = await Bun.file(".env").text()\n')
     try {
@@ -247,7 +248,7 @@ describe("runtime decisions", () => {
   })
 
   test("includes deno run target semantics in Luna's prompt", async () => {
-    const directory = await mkdtemp("/tmp/opencode/approval-reviewer-runtime-deno-run-")
+    const directory = await mkdtemp(join(tmpdir(), "approval-reviewer-runtime-deno-run-"))
     const script = join(directory, "runner.ts")
     await writeFile(script, 'const key = await Deno.readTextFile(".env")\n')
     try {
@@ -275,7 +276,7 @@ describe("runtime decisions", () => {
   })
 
   test("includes branch and preexisting staging in Luna's prompt for compound Git commits", async () => {
-    const directory = await mkdtemp("/tmp/opencode/approval-reviewer-runtime-git-")
+    const directory = await mkdtemp(join(tmpdir(), "approval-reviewer-runtime-git-"))
     try {
       await execFileAsync("git", ["init", "-b", "staging"], { cwd: directory })
       await execFileAsync("git", ["config", "user.email", "reviewer@example.invalid"], {

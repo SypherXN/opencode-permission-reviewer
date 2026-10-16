@@ -11,7 +11,7 @@ import {
   symlinkSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
 import { promisify } from "node:util"
 
 import { DEFAULT_CONFIG, resolveConfig } from "../src/config.ts"
@@ -1275,7 +1275,9 @@ describe("trust hardening — reviewer session isolation", () => {
 
   test("when the isolated directory is refused, no project reviewer or approval is created", async () => {
     const client = new MockClient()
-    const isolated = `${import.meta.dir}/.tmp-reviewer-isolated`
+    // The backend resolves the base before session.create. On Windows that
+    // rewrites the mixed slash in `${dir}/.tmp-reviewer-isolated`.
+    const isolated = resolve(`${import.meta.dir}/.tmp-reviewer-isolated`)
     const originalCreate = client.session.create.bind(client)
     client.session.create = async (options: unknown) => {
       const query = (options as { query?: { directory?: string } }).query
@@ -1334,20 +1336,24 @@ describe("trust hardening — read-only tools in mutating forms", () => {
 // --- ssh file evidence: FIFO and intermediate symlinks -------------------------------------
 
 describe("trust hardening — ssh stdin file evidence resilience", () => {
-  test("a FIFO at the stdin path returns quickly instead of blocking the review", async () => {
-    const directory = tempDir("reviewer-fifo-")
-    try {
-      const fifo = join(directory, "pipe")
-      await execFileAsync("mkfifo", [fifo])
-      const started = Date.now()
-      const result = await includeEvidenceFile(fifo, directory, directory, directory, 10_000)
-      expect(Date.now() - started).toBeLessThan(5_000)
-      expect(result.status).toBe("unavailable")
-      expect(result.reason).toContain("not a regular file")
-    } finally {
-      rmSync(directory, { recursive: true, force: true })
-    }
-  }, 10_000)
+  test.skipIf(process.platform === "win32")(
+    "a FIFO at the stdin path returns quickly instead of blocking the review",
+    async () => {
+      const directory = tempDir("reviewer-fifo-")
+      try {
+        const fifo = join(directory, "pipe")
+        await execFileAsync("mkfifo", [fifo])
+        const started = Date.now()
+        const result = await includeEvidenceFile(fifo, directory, directory, directory, 10_000)
+        expect(Date.now() - started).toBeLessThan(5_000)
+        expect(result.status).toBe("unavailable")
+        expect(result.reason).toContain("not a regular file")
+      } finally {
+        rmSync(directory, { recursive: true, force: true })
+      }
+    },
+    10_000,
+  )
 
   test("a stdin file behind an intermediate directory symlink inside the roots still resolves", async () => {
     const directory = tempDir("reviewer-symdir-")
@@ -1403,27 +1409,31 @@ describe("trust hardening — project config layer reads are bounded", () => {
     }
   }, 20_000)
 
-  test("a FIFO at the project config path returns quickly instead of blocking startup", async () => {
-    const projectDir = tempDir("reviewer-config-fifo-")
-    const outsideDir = tempDir("reviewer-config-outside-")
-    const warnings: string[] = []
-    const originalWarn = console.warn
-    console.warn = (message: string) => warnings.push(String(message))
-    try {
-      isolateGlobal(outsideDir)
-      mkdirSync(join(projectDir, ".opencode"), { recursive: true })
-      await execFileAsync("mkfifo", [projectConfigPath(projectDir)])
-      const started = Date.now()
-      const loaded = loadResolvedConfig(undefined, projectDir)
-      expect(Date.now() - started).toBeLessThan(5_000)
-      expect(loaded.confidenceThreshold).toBe(DEFAULT_CONFIG.confidenceThreshold)
-      expect(warnings.some((w) => w.includes("ignored"))).toBe(true)
-    } finally {
-      console.warn = originalWarn
-      rmSync(projectDir, { recursive: true, force: true })
-      rmSync(outsideDir, { recursive: true, force: true })
-    }
-  }, 20_000)
+  test.skipIf(process.platform === "win32")(
+    "a FIFO at the project config path returns quickly instead of blocking startup",
+    async () => {
+      const projectDir = tempDir("reviewer-config-fifo-")
+      const outsideDir = tempDir("reviewer-config-outside-")
+      const warnings: string[] = []
+      const originalWarn = console.warn
+      console.warn = (message: string) => warnings.push(String(message))
+      try {
+        isolateGlobal(outsideDir)
+        mkdirSync(join(projectDir, ".opencode"), { recursive: true })
+        await execFileAsync("mkfifo", [projectConfigPath(projectDir)])
+        const started = Date.now()
+        const loaded = loadResolvedConfig(undefined, projectDir)
+        expect(Date.now() - started).toBeLessThan(5_000)
+        expect(loaded.confidenceThreshold).toBe(DEFAULT_CONFIG.confidenceThreshold)
+        expect(warnings.some((w) => w.includes("ignored"))).toBe(true)
+      } finally {
+        console.warn = originalWarn
+        rmSync(projectDir, { recursive: true, force: true })
+        rmSync(outsideDir, { recursive: true, force: true })
+      }
+    },
+    20_000,
+  )
 
   test("an oversized project config is ignored with a warning", () => {
     const projectDir = tempDir("reviewer-config-huge-")

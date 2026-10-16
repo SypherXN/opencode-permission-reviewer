@@ -1,5 +1,5 @@
 import { homedir } from "node:os"
-import { normalize, resolve, sep } from "node:path"
+import { commandWithin, isCommandAbsolute, resolveCommandPath } from "../shell-path.ts"
 import type {
   CapabilityActionClass,
   CapabilityAssessment,
@@ -648,36 +648,29 @@ function classifyPath(
 ): { temporary: boolean; workspace: boolean; external: boolean } {
   if (!target || target.startsWith("&"))
     return { temporary: false, workspace: false, external: false }
-  let temp = false
-  let external = false
   let absolute: string
   if (target === "~" || target.startsWith("~/")) {
-    absolute = resolve(homedir(), target.slice(target === "~" ? 1 : 2))
-  } else if (!target.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(target)) {
-    absolute = resolve(directory, target)
+    absolute = resolveCommandPath(homedir(), target.slice(target === "~" ? 1 : 2))
+  } else if (!isCommandAbsolute(target)) {
+    absolute = resolveCommandPath(directory, target)
   } else {
-    absolute = normalize(target)
+    absolute = resolveCommandPath(target)
   }
-  const absolutePath = absolute.startsWith("/") || /^[A-Za-z]:[\\/]/.test(absolute)
-  const within = (root: string) => {
-    const normalizedRoot = normalize(root)
-    return absolute === normalizedRoot || absolute.startsWith(`${normalizedRoot}${sep}`)
-  }
-  if (!absolutePath) {
+  if (!isCommandAbsolute(absolute)) {
     // A path that still has no absolute form cannot be classified.
-    return { temporary: temp, workspace: false, external }
+    return { temporary: false, workspace: false, external: false }
   }
-  const workspace = within(directory) || within(worktree)
-  temp =
-    absolute === "/tmp" ||
-    absolute.startsWith("/tmp/") ||
-    absolute === "/var/tmp" ||
-    absolute.startsWith("/var/tmp/") ||
-    absolute === "/dev/shm" ||
-    absolute.startsWith("/dev/shm/") ||
-    absolute === "/dev/null"
-  external = !workspace && !temp
-  return { temporary: temp, workspace, external }
+  const workspace = commandWithin(absolute, directory) || commandWithin(absolute, worktree)
+  const slash = absolute.replaceAll("\\", "/")
+  const temp =
+    slash === "/tmp" ||
+    slash.startsWith("/tmp/") ||
+    slash === "/var/tmp" ||
+    slash.startsWith("/var/tmp/") ||
+    slash === "/dev/shm" ||
+    slash.startsWith("/dev/shm/") ||
+    slash === "/dev/null"
+  return { temporary: temp, workspace, external: !workspace && !temp }
 }
 
 function destinationFromTokens(tokens: ShellToken[]): string[] {

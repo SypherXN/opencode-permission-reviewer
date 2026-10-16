@@ -487,6 +487,21 @@ export function lexSegments(command: string, state?: { tokensRemaining: number }
     if (c === "\\" && i + 1 < command.length) {
       const next = command[i + 1]!
       raw += "\\" + next
+      // On Windows, an unquoted drive path keeps its separators. Bash would
+      // eat them, but the host path and the evidence reader need them. Any
+      // other unquoted escape, including backslash-newline, stays bash-compatible.
+      // Linux never takes this branch.
+      if (
+        process.platform === "win32" &&
+        next !== "\n" &&
+        next !== "\r" &&
+        /^[A-Za-z]:(?:\\[^\\]*)*$/.test(value)
+      ) {
+        appendValue("\\" + next, false)
+        hasToken = true
+        i += 2
+        continue
+      }
       // Backslash-newline is a line continuation outside quotes: both
       // characters vanish, so `r\<newline>m` lexes as the token `rm`.
       if (next !== "\n" && next !== "\r") {

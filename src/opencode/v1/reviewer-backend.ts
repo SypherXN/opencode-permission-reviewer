@@ -172,7 +172,22 @@ export class V1ReviewerBackend {
         await handle.close()
       }
       await assertReplaceable()
-      await rename(temporary, path)
+      // Complete temp file; Windows EPERM means a reader still has the destination open.
+      const attempts = process.platform === "win32" ? 100 : 1
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          await rename(temporary, path)
+          break
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code
+          const retryable =
+            process.platform === "win32" &&
+            (code === "EPERM" || code === "EBUSY" || code === "EACCES") &&
+            attempt + 1 < attempts
+          if (!retryable) throw error
+          await new Promise((resolveDelay) => setTimeout(resolveDelay, 1))
+        }
+      }
     } finally {
       await rm(temporary, { force: true })
     }

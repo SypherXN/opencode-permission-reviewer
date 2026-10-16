@@ -9,7 +9,7 @@ import { assert, sha256 } from "./util.mjs"
 export const PINNED_BLOBS = {
   "src/policy.ts": "72dc68cc8de6f536b196e3ffbe840f8b2236cd01",
   "src/context.ts": "5473abbe19ccce27163ceaaf87a63e63e6d5215a",
-  "src/config.ts": "5799271b0c8ea441f96e89ce5f1c085879ba72f6",
+  "src/config.ts": "f7f4336209224a8a9d44f3a43bdf883cace96699",
   "src/decision.ts": "ad3443f3bf2ca1b34b3b23e8115c79148e19238b",
   "src/policy/policy-engine.ts": "b4470dc188d956cc0ed25454c2d34465110fe1be",
   "src/escalation.ts": "947f5ed665600927e21be343995cdc4993a45f5a",
@@ -17,13 +17,17 @@ export const PINNED_BLOBS = {
   "src/emergency-brake.ts": "f583b97b7d917b785c39ab208faa80b45fb6b6e8",
   "src/redact.ts": "e93e4d379b64866de9848a8a5a9b5d7b1e4a8f3e",
   "src/capability/command-parser.ts": "926def261a0f1af1eec4a5991a89eb24da32af59",
-  "src/capability/bash-analyzer.ts": "dcf60b95b18ffe3a0256a01075bd34634265bfec",
-  "src/shell-lexer.ts": "eaf40e0f9a66f82e61ff4c38532c103c37f82759",
+  "src/capability/bash-analyzer.ts": "9837e06aa8908acc75b788de775af0ad168b3b6d",
+  "src/shell-lexer.ts": "869f76267044afeaa1cf75b0330b3e34b11395dd",
   "src/capability/heredoc-extractor.ts": "de3c1bb00f5d7e430c86845455ce6de6b1c94f6c",
   "src/system-one/review.ts": "5ab2c36e4dd19634b9de7a02ffeb9937414112e2",
 }
-const gitBlob = (bytes) =>
-  createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex")
+const gitBlob = (bytes) => {
+  // Pins are LF git blobs. A Windows checkout may store CRLF; the extra
+  // carriage returns are not a source change.
+  const normalized = Buffer.from(bytes.toString("utf8").replaceAll("\r\n", "\n"), "utf8")
+  return createHash("sha1").update(`blob ${normalized.length}\0`).update(normalized).digest("hex")
+}
 export async function sourceSnapshot(repo) {
   const files = {}
   async function walk(dir, rel = "") {

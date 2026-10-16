@@ -17,6 +17,7 @@ import {
   existsSync,
   fstatSync,
   ftruncateSync,
+  lstatSync,
   fsyncSync,
   mkdirSync,
   openSync,
@@ -250,6 +251,7 @@ export function writeBackup(source: string, preferred: string): string {
   let sourceFd: number | undefined
   let data: Buffer
   try {
+    assertRegularConfig(source)
     sourceFd = openSync(
       source,
       fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
@@ -337,7 +339,10 @@ function resolveTargets(
   wantTui: boolean,
   host: HostGeneration,
 ): { config: string; tui?: string } {
-  const globalDir = join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "opencode")
+  const globalDir = join(
+    process.env.XDG_CONFIG_HOME ?? join(homeDirectory(), ".config"),
+    "opencode",
+  )
   const globalCfg = pickExisting([
     join(globalDir, "opencode.json"),
     join(globalDir, "opencode.jsonc"),
@@ -370,9 +375,29 @@ type ConfigSnapshot =
   | { status: "missing" }
   | { status: "error" }
 
+function homeDirectory(): string {
+  const home = process.env.HOME
+  if (typeof home === "string" && home.length > 0) return home
+  return homedir()
+}
+
+function assertRegularConfig(path: string): void {
+  let info: ReturnType<typeof lstatSync>
+  try {
+    info = lstatSync(path)
+  } catch (error) {
+    if ((error as { code?: unknown }).code === "ENOENT") return
+    throw error
+  }
+  if (info.isSymbolicLink() || !info.isFile())
+    throw new Error(`Config is not a regular file: ${path}`)
+}
+
 function readConfigFile(path: string): ConfigSnapshot {
   let fd: number | undefined
   try {
+    const info = lstatSync(path)
+    if (info.isSymbolicLink() || !info.isFile()) return { status: "error" }
     // The parsed config and fingerprint must describe the same opened file.
     fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK)
     if (!fstatSync(fd).isFile()) return { status: "error" }
@@ -487,6 +512,7 @@ export function writeEntry(
   fingerprint?: string,
 ): void {
   const key = host === "v2" ? "plugins" : "plugin"
+  assertRegularConfig(path)
   if (create) {
     mkdirSync(dirname(path), { recursive: true })
     const schema =

@@ -13,6 +13,11 @@ async function fixture(): Promise<string> {
   return directory
 }
 
+/** Evidence JSON escapes backslashes, so a raw Windows path is not a substring. */
+function jsonPath(filePath: string): string {
+  return JSON.stringify(filePath)
+}
+
 afterEach(async () => {
   await Promise.all(
     temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true })),
@@ -159,7 +164,7 @@ describe("local script evidence enrichment", () => {
       12_000,
     )
     expect(result.text).toContain("resolved after cd")
-    expect(result.text).toContain(join(project, "task.py"))
+    expect(result.text).toContain(jsonPath(join(project, "task.py")))
   })
 
   test("a cd outside the approved roots never mints an evidence root", async () => {
@@ -274,7 +279,7 @@ describe("local script evidence enrichment", () => {
       directory,
       8_000,
     )
-    expect(cdResult.text).toContain(join(directory, "task.ts"))
+    expect(cdResult.text).toContain(jsonPath(join(directory, "task.ts")))
   })
 
   test("does not attach package manifest scripts or option values as bun run evidence", async () => {
@@ -370,7 +375,7 @@ describe("local script evidence enrichment", () => {
       )
       expect(result.text).toContain('"interpreter": "deno"')
       expect(result.text).toContain('"status": "included"')
-      expect(result.text).toContain(expected)
+      expect(result.text).toContain(jsonPath(expected))
     }
   })
 
@@ -426,7 +431,7 @@ describe("local script evidence enrichment", () => {
       )
       expect(result.text).toContain('"interpreter": "tsx"')
       expect(result.text).toContain('"status": "included"')
-      expect(result.text).toContain(expected)
+      expect(result.text).toContain(jsonPath(expected))
     }
   })
 

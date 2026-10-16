@@ -309,6 +309,7 @@ export function resolveConfig(options: Record<string, unknown> | undefined): Rev
       : DEFAULT_CONFIG.variant
   const outputFormat = source.outputFormat === "text" ? "text" : "json_schema"
   const escalationReviewer = resolveEscalationReviewer(source.escalationReviewer)
+  const moduleRoute = resolveModuleRouting(source.moduleRouting)
   const policy =
     typeof source.policy === "string" && source.policy.trim().length > 0
       ? source.policy.trim()
@@ -323,6 +324,10 @@ export function resolveConfig(options: Record<string, unknown> | undefined): Rev
     variant,
     outputFormat,
     ...(escalationReviewer === undefined ? {} : { escalationReviewer }),
+    ...(moduleRoute.moduleRouting === undefined
+      ? {}
+      : { moduleRouting: moduleRoute.moduleRouting }),
+    ...(moduleRoute.moduleRoutingRejected ? { moduleRoutingRejected: true } : {}),
     timeoutMs: boundedInteger(source.timeoutMs, DEFAULT_CONFIG.timeoutMs, 5_000, 600_000),
     ...(source.reviewBudgetMs === undefined
       ? {}
@@ -460,6 +465,78 @@ export function splitModel(model: string): { providerID: string; modelID: string
   return {
     providerID: model.slice(0, slash),
     modelID: model.slice(slash + 1),
+  }
+}
+
+const MODULE_ROUTING_KEYS = ["allowPaid", "enabled", "models", "module"]
+
+function plainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+/** OpenCode `jev-*-free` is the only System One route treated as non-paid. */
+export function isFreeSystemOneModel(providerID: string, modelID: string): boolean {
+  return (
+    providerID === "opencode" &&
+    modelID.endsWith("-free") &&
+    isSystemOneReviewerModel(`${providerID}/${modelID}`)
+  )
+}
+
+/** `enabled: false` keeps the historical direct model, even if other fields are present. */
+export function isModuleRoutingOptOut(value: unknown): boolean {
+  return plainObject(value) && value.enabled === false
+}
+
+export function isValidModuleRouting(
+  value: unknown,
+): value is { enabled: true; module: "opr-jev"; allowPaid: boolean; models: string[] } {
+  if (!plainObject(value)) return false
+  const keys = Object.keys(value).sort()
+  if (
+    keys.length !== MODULE_ROUTING_KEYS.length ||
+    keys.some((key, index) => key !== MODULE_ROUTING_KEYS[index])
+  ) {
+    return false
+  }
+  if (
+    value.enabled !== true ||
+    value.module !== "opr-jev" ||
+    typeof value.allowPaid !== "boolean"
+  ) {
+    return false
+  }
+  if (!Array.isArray(value.models) || value.models.length === 0) return false
+  const seen = new Set<string>()
+  for (const model of value.models) {
+    if (typeof model !== "string" || model.trim() !== model) return false
+    let parsed: { providerID: string; modelID: string }
+    try {
+      parsed = splitModel(model)
+    } catch {
+      return false
+    }
+    if (!isSystemOneReviewerModel(model)) return false
+    const key = `${parsed.providerID}\0${parsed.modelID}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    if (!value.allowPaid && !isFreeSystemOneModel(parsed.providerID, parsed.modelID)) return false
+  }
+  return true
+}
+
+export function resolveModuleRouting(value: unknown): {
+  moduleRouting?: ReviewerConfig["moduleRouting"]
+  moduleRoutingRejected?: true
+} {
+  if (value === undefined || isModuleRoutingOptOut(value)) return {}
+  if (!isValidModuleRouting(value)) return { moduleRoutingRejected: true }
+  return {
+    moduleRouting: {
+      module: "opr-jev",
+      allowPaid: value.allowPaid,
+      models: value.models.map((model) => splitModel(model)),
+    },
   }
 }
 

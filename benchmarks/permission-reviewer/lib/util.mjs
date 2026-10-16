@@ -43,7 +43,10 @@ export async function privateDir(path) {
       existing.isDirectory() && !existing.isSymbolicLink(),
       `Output path is not a regular directory: ${path}`,
     )
-    assert((existing.mode & 0o077) === 0, `Output directory is not private: ${path}`)
+    // Windows stat() does not report Unix permission bits, so a private
+    // directory cannot be distinguished from a public one by mode.
+    if (process.platform !== "win32")
+      assert((existing.mode & 0o077) === 0, `Output directory is not private: ${path}`)
     return
   }
   await mkdir(path, { recursive: true, mode: 0o700 })

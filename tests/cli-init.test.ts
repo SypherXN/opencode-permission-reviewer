@@ -93,7 +93,10 @@ describe("cli init", () => {
   test("auto accepts supported versions and refuses unsupported versions without writes", async () => {
     home = mkdtempSync(join(tmpdir(), "init-home-"))
     project = mkdtempSync(join(tmpdir(), "init-proj-"))
-    const binary = join(home, "fixture-opencode")
+    const binary = join(
+      home,
+      process.platform === "win32" ? "fixture-opencode.cmd" : "fixture-opencode",
+    )
     for (const [version, supported] of [
       ["1.18.28", false],
       ["1.18.29", true],
@@ -106,7 +109,13 @@ describe("cli init", () => {
       ["2.0.3-beta.1", false],
       ["3.0.0", false],
     ] as const) {
-      writeFileSync(binary, `#!/bin/sh\nprintf '${version}\\n'\n`, { mode: 0o700 })
+      writeFileSync(
+        binary,
+        process.platform === "win32"
+          ? `@echo off\r\necho ${version}\r\n`
+          : `#!/bin/sh\nprintf '${version}\\n'\n`,
+        { mode: 0o700 },
+      )
       const result = await run(["--binary", binary, "--dry-run", "--project", project], {
         HOME: home,
       })

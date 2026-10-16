@@ -75,7 +75,7 @@ describe("audit writer", () => {
     expect(JSON.parse(lines[0]!).requestID).toBe("per_a")
     expect(JSON.parse(lines[1]!).requestID).toBe("per_b")
     const info = await stat(auditPath)
-    expect(info.mode & 0o777).toBe(0o600)
+    if (process.platform !== "win32") expect(info.mode & 0o777).toBe(0o600)
   })
 
   test("lazily creates nested directories", async () => {
@@ -173,7 +173,13 @@ describe("audit writer", () => {
     // same path a FIFO or socket takes after a successful non-blocking open.
     const logs: unknown[] = []
     const writeAudit = createAuditWriter(
-      { ...DEFAULT_CONFIG, audit: true, auditPath: "/dev/null" },
+      {
+        ...DEFAULT_CONFIG,
+        audit: true,
+        // `NUL` resolves to a regular file named NUL. The device path stays a
+        // character device through path.resolve, matching /dev/null.
+        auditPath: process.platform === "win32" ? "\\\\.\\NUL" : "/dev/null",
+      },
       (_msg, details) => logs.push(details),
     )!
     await expect(writeAudit(record())).resolves.toBeUndefined()
@@ -233,7 +239,7 @@ console.log("DONE")`,
     const handle = await open(auditPath, "r")
     try {
       const info = await handle.stat()
-      expect(info.mode & 0o777).toBe(0o600)
+      if (process.platform !== "win32") expect(info.mode & 0o777).toBe(0o600)
       const parsed = JSON.parse((await readFile(handle, "utf8")).trim()) as ReviewAuditRecord
       expect(parsed.requestID).toBe("per_keep")
     } finally {
@@ -251,7 +257,7 @@ console.log("DONE")`,
     const handle = await open(auditPath, "r")
     try {
       const info = await handle.stat()
-      expect(info.mode & 0o777).toBe(0o600)
+      if (process.platform !== "win32") expect(info.mode & 0o777).toBe(0o600)
       const lines = (await readFile(handle, "utf8")).trim().split("\n")
       expect(lines).toHaveLength(2)
       expect((JSON.parse(lines[1]!) as ReviewAuditRecord).requestID).toBe("loose_2")

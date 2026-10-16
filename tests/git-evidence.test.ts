@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { execFile } from "node:child_process"
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { delimiter, join } from "node:path"
 import { promisify } from "node:util"
 import { enrichGitEvidence } from "../src/git-evidence.ts"
 import { request } from "./helpers.ts"
@@ -29,6 +29,16 @@ async function repositoryAt(directory: string): Promise<string> {
 
 async function repository(): Promise<string> {
   return repositoryAt(await mkdtemp(join(tmpdir(), "approval-reviewer-git-")))
+}
+
+/** git rev-parse --show-toplevel prints forward slashes on Windows. */
+function gitRepositoryPath(directory: string): string {
+  return process.platform === "win32" ? directory.replaceAll("\\", "/") : directory
+}
+
+function repositoryRootOf(text: string): string | undefined {
+  return (JSON.parse(text.replace(/^GIT_STATE_ANALYSIS\n/, "")) as { repositoryRoot?: string })
+    .repositoryRoot
 }
 
 afterEach(async () => {
@@ -88,18 +98,29 @@ describe("Git state evidence enrichment", () => {
     temporaryDirectories.push(directory)
     const bin = join(directory, "bin")
     await mkdir(bin)
-    const executable = join(bin, "git")
-    await writeFile(
-      executable,
-      `#!/usr/bin/env bun
-const args = process.argv.slice(2)
-if (args.includes("--get-regexp")) process.exit(1)
-if (args.includes("--show-toplevel")) console.log(process.cwd())
-else if (args.includes("status")) process.stdout.write(process.env.REVIEWER_SYNTHETIC_GIT_STATUS ?? "")
-else process.exit(1)
-`,
-    )
-    await chmod(executable, 0o755)
+    const fakeGitSource = [
+      "const index = process.argv.findIndex((value) => /(^|[\\\\/])git(\\\\.exe)?$/i.test(value))",
+      "const args = process.argv.slice(index >= 0 ? index + 1 : 2)",
+      "if (args.includes(\"--get-regexp\")) process.exit(1)",
+      "if (args.includes(\"--show-toplevel\")) { console.log(process.cwd()); process.exit(0) }",
+      "if (args.includes(\"status\")) { process.stdout.write(process.env.REVIEWER_SYNTHETIC_GIT_STATUS ?? \"\"); process.exit(0) }",
+      "process.exit(1)",
+    ].join("\n")
+    if (process.platform === "win32") {
+      const script = join(bin, "fake-git.js")
+      await writeFile(script, fakeGitSource)
+      await execFileAsync(process.execPath, [
+        "build",
+        script,
+        "--compile",
+        "--outfile",
+        join(bin, "git.exe"),
+      ])
+    } else {
+      const executable = join(bin, "git")
+      await writeFile(executable, "#!/usr/bin/env bun\n" + fakeGitSource)
+      await chmod(executable, 0o755)
+    }
     const entry = new URL("../src/git-evidence.ts", import.meta.url).href
     const command = "git checkout HEAD -- target.txt"
     const input = request({ patterns: [command], metadata: { command } })
@@ -116,7 +137,7 @@ console.log((await enrichGitEvidence(${JSON.stringify(input)}, process.cwd(), 80
         cwd: directory,
         env: {
           ...process.env,
-          PATH: `${bin}:${process.env.PATH}`,
+          PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
           REVIEWER_SYNTHETIC_GIT_STATUS: stdout,
         },
         stdout: "pipe",
@@ -181,7 +202,7 @@ console.log((await enrichGitEvidence(${JSON.stringify(input)}, process.cwd(), 80
         outer,
         24_000,
       )
-      expect(result.text).toContain(`"repositoryRoot": "${directory}"`)
+      expect(repositoryRootOf(result.text)).toBe(gitRepositoryPath(directory))
       expect(result.text).toContain('"branch": "staging"')
       expect(result.text).toContain('"affectedTargetNumstat": "1\\t1\\ttarget.py')
     }
@@ -204,7 +225,7 @@ console.log((await enrichGitEvidence(${JSON.stringify(input)}, process.cwd(), 80
       )
       expect(result.text).toContain('"status": "unavailable"')
       expect(result.text).toContain("planned Git directory is outside approved enrichment roots")
-      expect(result.text).not.toContain(`"repositoryRoot": "${elsewhere}"`)
+      expect(repositoryRootOf(result.text)).not.toBe(gitRepositoryPath(elsewhere))
       expect(result.text).not.toContain('"branch": "staging"')
     }
   })
@@ -256,7 +277,7 @@ console.log((await enrichGitEvidence(${JSON.stringify(input)}, process.cwd(), 80
       24_000,
       outer,
     )
-    expect(result.text).toContain(`"repositoryRoot": "${outer}"`)
+    expect(repositoryRootOf(result.text)).toBe(gitRepositoryPath(outer))
     expect(result.text).toContain('"branch": "staging"')
   })
 

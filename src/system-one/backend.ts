@@ -8,6 +8,14 @@ import { redactSecrets } from "../redact.ts"
 import { splitModel } from "../config.ts"
 import type { ReviewEnvelope, ReviewExecutionResult, ReviewerConfig } from "../types.ts"
 import {
+  OPR_JEV_MODULE,
+  interpretCooldownReport,
+  interpretModuleSelection,
+  isStructuredRateLimit,
+  permitSelectedModel,
+  type ModuleRoutingClient,
+} from "./module-routing.ts"
+import {
   enforceParsedSystemOneReview,
   parseSystemOneReview,
   SYSTEM_ONE_QUESTIONS,
@@ -87,6 +95,7 @@ export function createSystemOneInvoker(
 /** Calls Jev directly and delegates only valid but difficult decisions. */
 export class SystemOneReviewerBackend {
   private readonly jobs = new Set<Promise<ReviewExecutionResult>>()
+  private readonly createInvoke: (config: ReviewerConfig) => SystemOneInvoke
 
   constructor(
     private readonly config: ReviewerConfig,
@@ -94,7 +103,11 @@ export class SystemOneReviewerBackend {
     private readonly escalationModel?: string,
     private readonly invoke?: SystemOneInvoke,
     private readonly recordReviewerMs?: (envelope: ReviewEnvelope, ms: number) => void,
-  ) {}
+    private readonly modules?: ModuleRoutingClient,
+    createInvoke?: (config: ReviewerConfig) => SystemOneInvoke,
+  ) {
+    this.createInvoke = createInvoke ?? createSystemOneInvoker
+  }
 
   owns(): boolean {
     return false
@@ -114,12 +127,146 @@ export class SystemOneReviewerBackend {
     await Promise.allSettled([...this.jobs])
   }
 
+  private ensureActive(attempt: ReviewAttempt): void {
+    if (attempt.active()) return
+    throw attempt.signal.reason instanceof Error
+      ? attempt.signal.reason
+      : new Error("Review cancelled")
+  }
+
+  private failClosed(reason: string, reviewerModel = this.config.model): ReviewExecutionResult {
+    return applyEscalationDisposition(
+      {
+        kind: "escalate",
+        reason,
+        decisionSource: "failure-safe",
+        reviewerModel,
+      },
+      this.config,
+      "reviewer-failure",
+    )
+  }
+
+  private async conclude(
+    response: unknown,
+    config: ReviewerConfig,
+    envelope: ReviewEnvelope,
+    attempt: ReviewAttempt,
+    escalation: ReasoningEscalation | undefined,
+  ): Promise<ReviewExecutionResult> {
+    const parsed = parseSystemOneReview(response, config)
+    if (!parsed) {
+      return applyEscalationDisposition(
+        {
+          kind: "escalate",
+          reason: "System One reviewer returned a missing, invalid, or ambiguous decision.",
+          decisionSource: "failure-safe",
+          reviewerModel: config.model,
+        },
+        this.config,
+        "invalid-decision",
+      )
+    }
+
+    const enforced = enforceParsedSystemOneReview(parsed, config)
+    if (enforced.kind !== "escalate") {
+      return {
+        ...enforced,
+        decisionSource: "system-one-reviewer",
+        reviewerModel: config.model,
+      }
+    }
+
+    if (escalation && this.escalationModel && parsed.reasoningRecommended) {
+      const secondary = reconcileReasoningEscalation(await escalation(envelope, attempt))
+      return {
+        ...secondary,
+        reviewerModel: secondary.reviewerModel ?? this.escalationModel,
+        reviewerEscalatedFrom: { model: config.model, reason: enforced.reason },
+      }
+    }
+
+    return applyEscalationDisposition(
+      {
+        ...enforced,
+        decisionSource: "system-one-reviewer",
+        reviewerModel: config.model,
+      },
+      this.config,
+      "general",
+    )
+  }
+
+  private async reviewRouted(
+    state: SystemOneState,
+    envelope: ReviewEnvelope,
+    attempt: ReviewAttempt,
+    escalation: ReasoningEscalation | undefined,
+    useModel: (model: string) => void,
+  ): Promise<ReviewExecutionResult> {
+    const routing = this.config.moduleRouting
+    if (!routing || !this.modules) {
+      return this.failClosed(
+        "Quartermaster module routing is enabled, but no Quartermaster client is available, so the direct Jev transport was not called.",
+      )
+    }
+    let blocked: { providerID: string; modelID: string } | undefined
+    for (let transport = 0; transport < 2; transport++) {
+      this.ensureActive(attempt)
+      const selection = interpretModuleSelection(
+        await attempt.wait(this.modules.select(attempt.signal)),
+      )
+      const chosen = permitSelectedModel(routing, selection, blocked)
+      if (!chosen.ok) return this.failClosed(chosen.reason)
+      useModel(chosen.model)
+      const selectedConfig = { ...this.config, model: chosen.model }
+      let response: unknown
+      try {
+        this.ensureActive(attempt)
+        response = await attempt.wait(this.createInvoke(selectedConfig)(state, attempt.signal))
+      } catch (error) {
+        if (attempt.signal.aborted || !isStructuredRateLimit(error)) throw error
+        if (transport === 1) {
+          return this.failClosed(
+            "The replacement System One model also returned HTTP 429, so the review stopped without another call.",
+            chosen.model,
+          )
+        }
+        this.ensureActive(attempt)
+        const report = interpretCooldownReport(
+          await attempt.wait(
+            this.modules.reportRateLimit(
+              { providerID: chosen.providerID, modelID: chosen.modelID },
+              attempt.signal,
+            ),
+          ),
+          {
+            module: OPR_JEV_MODULE,
+            providerID: chosen.providerID,
+            modelID: chosen.modelID,
+          },
+        )
+        if (!report.accepted) {
+          return this.failClosed(
+            "Quartermaster did not accept the exact-model rate-limit report, so no replacement model was called.",
+            chosen.model,
+          )
+        }
+        blocked = { providerID: chosen.providerID, modelID: chosen.modelID }
+        continue
+      }
+      return this.conclude(response, selectedConfig, envelope, attempt, escalation)
+    }
+    return this.failClosed("Quartermaster module routing stopped without a System One decision.")
+  }
+
   private async runReview(
     envelope: ReviewEnvelope,
     attempt: ReviewAttempt,
     escalation: ReasoningEscalation | undefined,
   ): Promise<ReviewExecutionResult> {
     const started = performance.now()
+    let reviewerModel = this.config.model
     try {
       const evidence = buildEvidenceResult(envelope, this.config)
       envelope.actionEvidenceComplete =
@@ -131,57 +278,29 @@ export class SystemOneReviewerBackend {
         },
         untrustedEvidence: evidence.text,
       }
+      if (this.config.moduleRoutingRejected) {
+        return this.failClosed(
+          "Trusted Quartermaster module routing configuration is invalid, so the direct Jev transport was not called.",
+        )
+      }
+      if (this.config.moduleRouting) {
+        Object.freeze(state.trustedPolicy)
+        Object.freeze(state)
+        return await this.reviewRouted(state, envelope, attempt, escalation, (model) => {
+          reviewerModel = model
+        })
+      }
       const response = await attempt.wait(
         (this.invoke ?? createSystemOneInvoker(this.config))(state, attempt.signal),
       )
-      const parsed = parseSystemOneReview(response, this.config)
-      if (!parsed) {
-        return applyEscalationDisposition(
-          {
-            kind: "escalate",
-            reason: "System One reviewer returned a missing, invalid, or ambiguous decision.",
-            decisionSource: "failure-safe",
-            reviewerModel: this.config.model,
-          },
-          this.config,
-          "invalid-decision",
-        )
-      }
-
-      const enforced = enforceParsedSystemOneReview(parsed, this.config)
-      if (enforced.kind !== "escalate") {
-        return {
-          ...enforced,
-          decisionSource: "system-one-reviewer",
-          reviewerModel: this.config.model,
-        }
-      }
-
-      if (escalation && this.escalationModel && parsed.reasoningRecommended) {
-        const secondary = reconcileReasoningEscalation(await escalation(envelope, attempt))
-        return {
-          ...secondary,
-          reviewerModel: secondary.reviewerModel ?? this.escalationModel,
-          reviewerEscalatedFrom: { model: this.config.model, reason: enforced.reason },
-        }
-      }
-
-      return applyEscalationDisposition(
-        {
-          ...enforced,
-          decisionSource: "system-one-reviewer",
-          reviewerModel: this.config.model,
-        },
-        this.config,
-        "general",
-      )
+      return await this.conclude(response, this.config, envelope, attempt, escalation)
     } catch (error) {
       return applyEscalationDisposition(
         {
           kind: "escalate",
           reason: formatFailureReason("System One reviewer", error),
           decisionSource: "failure-safe",
-          reviewerModel: this.config.model,
+          reviewerModel,
         },
         this.config,
         "reviewer-failure",

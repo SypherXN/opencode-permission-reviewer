@@ -169,9 +169,9 @@ test("the isolated location is created with config that excludes MCP", async () 
     const bootstrap = await readFile(join(harness.base, "reviewer-isolation.js"), "utf8")
     expect(bootstrap).toContain('Object.defineProperty(cfg, "mcp"')
     const configMode = (await stat(join(harness.base, "opencode.json"))).mode & 0o777
-    expect(configMode).toBe(0o600)
+    if (process.platform !== "win32") expect(configMode).toBe(0o600)
     const bootstrapMode = (await stat(join(harness.base, "reviewer-isolation.js"))).mode & 0o777
-    expect(bootstrapMode).toBe(0o600)
+    if (process.platform !== "win32") expect(bootstrapMode).toBe(0o600)
   } finally {
     await harness.cleanup()
   }
@@ -228,7 +228,7 @@ test("concurrent first reviews share one location and keep sessions independent"
     const configPath = join(harness.base, "opencode.json")
     const isolated = JSON.parse(await readFile(configPath, "utf8")) as { plugin: string[] }
     expect(isolated.plugin).toEqual(["./reviewer-isolation.js"])
-    expect((await stat(configPath)).mode & 0o777).toBe(0o600)
+    if (process.platform !== "win32") expect((await stat(configPath)).mode & 0o777).toBe(0o600)
     const bootstrap = await readFile(join(harness.base, "reviewer-isolation.js"), "utf8")
     expect(bootstrap).toContain('Object.defineProperty(cfg, "mcp"')
   } finally {
@@ -308,18 +308,19 @@ test("a second backend re-asserts the config in the shared, persistent location"
       try {
         const isolated = JSON.parse(await configFile.readFile("utf8")) as { plugin: string[] }
         expect(isolated.plugin).toEqual(["./reviewer-isolation.js"])
-        expect((await configFile.stat()).mode & 0o777).toBe(0o600)
+        if (process.platform !== "win32") expect((await configFile.stat()).mode & 0o777).toBe(0o600)
       } finally {
         await configFile.close()
       }
       const bootstrapFile = await open(bootstrapPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
       try {
-        expect((await bootstrapFile.stat()).mode & 0o777).toBe(0o600)
+        if (process.platform !== "win32")
+          expect((await bootstrapFile.stat()).mode & 0o777).toBe(0o600)
         expect(await bootstrapFile.readFile("utf8")).toContain('Object.defineProperty(cfg, "mcp"')
       } finally {
         await bootstrapFile.close()
       }
-      expect((await stat(base)).mode & 0o777).toBe(0o700)
+      if (process.platform !== "win32") expect((await stat(base)).mode & 0o777).toBe(0o700)
     } finally {
       await second.cleanup()
     }
@@ -398,36 +399,40 @@ for (const [label, inventory] of [
 
 for (const name of ["opencode.json", "reviewer-isolation.js"]) {
   for (const kind of ["symlink", "hardlink", "fifo", "directory"] as const) {
-    test(`a ${kind} at ${name} is refused without changing its target`, async () => {
-      const root = await mkdtemp(join(tmpdir(), "reviewer-v1-file-refusal-"))
-      const base = join(root, "isolated")
-      const harness = fixture({ base })
-      const outside = join(root, "outside")
-      const target = join(base, name)
-      try {
-        expect((await harness.run()).kind).toBe("allow")
-        await rm(target)
-        await write(outside, "preserve synthetic fixture")
-        if (kind === "symlink") await symlink(outside, target)
-        else if (kind === "hardlink") await link(outside, target)
-        else if (kind === "fifo") execFileSync("mkfifo", [target])
-        else {
-          const { mkdir } = await import("node:fs/promises")
-          await mkdir(target)
+    test.skipIf(process.platform === "win32" && kind === "fifo")(
+      `a ${kind} at ${name} is refused without changing its target`,
+      async () => {
+        const root = await mkdtemp(join(tmpdir(), "reviewer-v1-file-refusal-"))
+        const base = join(root, "isolated")
+        const harness = fixture({ base })
+        const outside = join(root, "outside")
+        const target = join(base, name)
+        try {
+          expect((await harness.run()).kind).toBe("allow")
+          await rm(target)
+          await write(outside, "preserve synthetic fixture")
+          if (kind === "symlink") await symlink(outside, target)
+          else if (kind === "hardlink") await link(outside, target)
+          else if (kind === "fifo") execFileSync("mkfifo", [target])
+          else {
+            const { mkdir } = await import("node:fs/promises")
+            await mkdir(target)
+          }
+          const second = fixture({ base })
+          const result = await second.run()
+          expect(result.kind).toBe("escalate")
+          expect(second.state().sessionIDs).toHaveLength(0)
+          expect(await readFile(outside, "utf8")).toBe("preserve synthetic fixture")
+          expect((await readdir(base)).some((file) => file.endsWith(".tmp"))).toBe(false)
+          await rm(target, { recursive: true, force: true })
+          expect((await second.run()).kind).toBe("allow")
+        } finally {
+          await harness.backend.waitForIdle()
+          await rm(root, { recursive: true, force: true })
         }
-        const second = fixture({ base })
-        const result = await second.run()
-        expect(result.kind).toBe("escalate")
-        expect(second.state().sessionIDs).toHaveLength(0)
-        expect(await readFile(outside, "utf8")).toBe("preserve synthetic fixture")
-        expect((await readdir(base)).some((file) => file.endsWith(".tmp"))).toBe(false)
-        await rm(target, { recursive: true, force: true })
-        expect((await second.run()).kind).toBe("allow")
-      } finally {
-        await harness.backend.waitForIdle()
-        await rm(root, { recursive: true, force: true })
-      }
-    }, 30_000)
+      },
+      30_000,
+    )
   }
 }
 

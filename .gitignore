@@ -17,6 +17,7 @@ opencode-permission-reviewer-v1.0.0-plan.md
 approval-reviewer-audit.jsonl
 permission-reviewer-audit.jsonl
 *-audit.jsonl
+/opencode-usage.json
 
 # env / secrets
 .env

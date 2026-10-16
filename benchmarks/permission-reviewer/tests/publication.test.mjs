@@ -104,10 +104,16 @@ test("private output handling does not chmod an existing public directory", asyn
   try {
     const publicPath = join(root, "public")
     await mkdir(publicPath)
+    const newPath = join(root, "private")
+    if (process.platform === "win32") {
+      // Unix modes are not observable here. A normal directory must still be usable.
+      await privateDir(publicPath)
+      await privateDir(newPath)
+      return
+    }
     await chmod(publicPath, 0o755)
     await assert.rejects(privateDir(publicPath), /not private/)
     assert.equal((await stat(publicPath)).mode & 0o777, 0o755)
-    const newPath = join(root, "private")
     await privateDir(newPath)
     assert.equal((await stat(newPath)).mode & 0o777, 0o700)
   } finally {

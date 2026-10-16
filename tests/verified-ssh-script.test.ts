@@ -2,9 +2,10 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
+import { existsSync } from "node:fs"
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { delimiter, join } from "node:path"
 import { MockClient, request } from "./helpers.ts"
 import { assembleEvidence, defaultEvidenceProviders } from "../src/context/evidence-assembler.ts"
 import { buildEvidenceResult } from "../src/context.ts"
@@ -200,24 +201,68 @@ describe("verified SSH script protocol", () => {
     const path = join(directory, "deploy.sh")
     const blockedMarker = join(directory, "blocked")
     const approvedMarker = join(directory, "executed")
-    const original = `printf done > ${approvedMarker}\n`
+    const original = "printf done > executed\n"
     await writeFile(path, original)
-    const fakeSsh = join(directory, "ssh")
-    await writeFile(fakeSsh, '#!/bin/sh\nfor arg do remote=$arg; done\nexec sh -c "$remote"\n', {
-      mode: 0o700,
-    })
+    if (process.platform === "win32") {
+      const realSh = (process.env.PATH ?? "")
+        .split(delimiter)
+        .map((entry) => join(entry, "sh.exe"))
+        .find((candidate) => existsSync(candidate))
+      if (realSh === undefined) throw new Error("Git sh.exe is not on PATH")
+      const fakeSsh = join(directory, "ssh.exe")
+      const fakeShell = join(directory, "sh.exe")
+      const sshScript = join(directory, "fake-ssh.js")
+      const shellScript = join(directory, "fake-sh.js")
+      await writeFile(
+        sshScript,
+        [
+          'import { spawn } from "node:child_process"',
+          'let index = -1; const slash = String.fromCharCode(92); process.argv.forEach((value, i) => { const name = value.toLowerCase().split(slash).pop().split("/").pop(); if (name === "ssh.exe" || name === "ssh") index = i })',
+          "const args = process.argv.slice(index >= 0 ? index + 1 : 1)",
+          'const remote = args.at(-1) ?? ""',
+          `const realSh = ${JSON.stringify(realSh)}`,
+          'const child = spawn(realSh, ["-c", remote], { stdio: "inherit" })',
+          'child.on("exit", (code) => process.exit(code ?? 1))',
+          'child.on("error", () => process.exit(1))',
+          "",
+        ].join("\n"),
+      )
+      await writeFile(
+        shellScript,
+        [
+          'import { spawn } from "node:child_process"',
+          `const realSh = ${JSON.stringify(realSh)}`,
+          'let index = -1; const slash = String.fromCharCode(92); process.argv.forEach((value, i) => { const name = value.toLowerCase().split(slash).pop().split("/").pop(); if (name === "sh.exe" || name === "sh") index = i })',
+          "const args = process.argv.slice(index >= 0 ? index + 1 : 1)",
+          'const flag = args.indexOf("-c")',
+          'if (flag >= 0 && typeof args[flag + 1] === "string")',
+          '  args[flag + 1] = args[flag + 1].replace(/\\bssh\\b/g, "./ssh.exe")',
+          'const child = spawn(realSh, args, { stdio: "inherit" })',
+          'child.on("exit", (code) => process.exit(code ?? 1))',
+          'child.on("error", () => process.exit(1))',
+          "",
+        ].join("\n"),
+      )
+      await execFileAsync(process.execPath, ["build", sshScript, "--compile", "--outfile", fakeSsh])
+      await execFileAsync(process.execPath, ["build", shellScript, "--compile", "--outfile", fakeShell])
+    } else {
+      const fakeSsh = join(directory, "ssh")
+      await writeFile(fakeSsh, '#!/bin/sh\nfor arg do remote=$arg; done\nexec sh -c "$remote"\n', {
+        mode: 0o700,
+      })
+    }
     const command = renderVerifiedSshScriptCommand({
-      path,
+      path: "deploy.sh",
       destination: "host.invalid",
       sha256: digest(original),
       shell: "bash",
     })
-    const env = { ...process.env, PATH: `${directory}:${process.env.PATH ?? ""}` }
-    await writeFile(path, `printf changed > ${blockedMarker}\n`)
-    await expect(execFileAsync("sh", ["-c", command], { env })).rejects.toThrow()
+    const env = { ...process.env, PATH: `${directory}${delimiter}${process.env.PATH ?? ""}` }
+    await writeFile(path, "printf changed > blocked\n")
+    await expect(execFileAsync("sh", ["-c", command], { env, cwd: directory })).rejects.toThrow()
     await expect(stat(blockedMarker)).rejects.toThrow()
     await writeFile(path, original)
-    await execFileAsync("sh", ["-c", command], { env })
+    await execFileAsync("sh", ["-c", command], { env, cwd: directory })
     expect(await readFile(approvedMarker, "utf8")).toBe("done")
   })
 
@@ -227,7 +272,7 @@ describe("verified SSH script protocol", () => {
     const content = "echo inspected\n".repeat(1900)
     await writeFile(path, content)
     const command = renderVerifiedSshScriptCommand({
-      path,
+      path: "deploy.sh",
       destination: "host.invalid",
       sha256: digest(content),
       shell: "bash",
@@ -279,7 +324,7 @@ describe("verified SSH script protocol", () => {
         "script",
         "command",
         "--file",
-        path,
+        "deploy.sh",
         "--host",
         "host.invalid",
       ],

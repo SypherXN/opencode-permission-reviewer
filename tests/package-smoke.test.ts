@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test"
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs"
-import { join, resolve } from "node:path"
+import { basename, dirname, join, resolve } from "node:path"
 import { tmpdir } from "node:os"
 
 const CWD = import.meta.dir + "/.."
@@ -52,8 +52,19 @@ afterAll(() => {
   if (installDir !== undefined) rmSync(installDir, { recursive: true, force: true })
 })
 
+function spawnTar(archive: string, args: string[]) {
+  // GNU tar reads "C:\archive.tgz" as host C. A relative name in that
+  // directory is a local archive on Windows and on POSIX.
+  return Bun.spawn({
+    cmd: ["tar", ...args],
+    cwd: dirname(archive),
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+}
+
 async function listTarball(path: string): Promise<string[]> {
-  const proc = Bun.spawn({ cmd: ["tar", "-tzf", path], stdout: "pipe", stderr: "pipe" })
+  const proc = spawnTar(path, ["-tzf", basename(path)])
   const [exitCode, text] = await Promise.all([proc.exited, new Response(proc.stdout).text()])
   if (exitCode !== 0) throw new Error("tar list failed")
   return text
@@ -64,11 +75,7 @@ async function listTarball(path: string): Promise<string[]> {
 }
 
 async function readFromTarball(path: string, member: string): Promise<string> {
-  const proc = Bun.spawn({
-    cmd: ["tar", "-xOzf", path, `package/${member}`],
-    stdout: "pipe",
-    stderr: "pipe",
-  })
+  const proc = spawnTar(path, ["-xOzf", basename(path), `package/${member}`])
   const [exitCode, text] = await Promise.all([proc.exited, new Response(proc.stdout).text()])
   if (exitCode !== 0) throw new Error(`tar extract ${member} failed`)
   return text

@@ -3,6 +3,10 @@ import type { Plugin } from "@opencode/plugin"
 import type { ReviewAttempt } from "../../core/review-attempt.ts"
 import { isSystemOneReviewerModel } from "../../config.ts"
 import { SystemOneReviewerBackend } from "../../system-one/backend.ts"
+import {
+  createQuartermasterModuleClient,
+  type QuartermasterRpcHost,
+} from "../../system-one/module-routing.ts"
 import type { ReviewEnvelope, ReviewExecutionResult, ReviewerConfig } from "../../types.ts"
 import { V2ReviewerBackend } from "./reviewer-backend.ts"
 
@@ -34,7 +38,17 @@ export function createV2ReviewerBackend(context: Context, config: ReviewerConfig
   if (!isSystemOneReviewerModel(config.model)) return new V2ReviewerBackend(context, config)
   const secondaryConfig = escalationConfig(config)
   const secondary = secondaryConfig ? new V2ReviewerBackend(context, secondaryConfig) : undefined
-  const primary = new SystemOneReviewerBackend(config, undefined, secondaryConfig?.model)
+  const modules = config.moduleRouting
+    ? createQuartermasterModuleClient(context as unknown as QuartermasterRpcHost)
+    : undefined
+  const primary = new SystemOneReviewerBackend(
+    config,
+    undefined,
+    secondaryConfig?.model,
+    undefined,
+    undefined,
+    modules,
+  )
   return {
     owns: (sessionID) => secondary?.owns(sessionID) ?? false,
     review: (envelope, attempt, client) =>

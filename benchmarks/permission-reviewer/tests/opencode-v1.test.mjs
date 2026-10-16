@@ -5,6 +5,7 @@ import { requestOpenCodeV1 } from "../lib/opencode-v1.mjs"
 import { validateModel } from "../lib/providers.mjs"
 import { decision } from "./helpers.mjs"
 import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 const model = {
   id: "grok-low",
@@ -85,7 +86,7 @@ test("OpenCode host receives the exact prompt with low variant and no operationa
       seen.every((request) =>
         new URL(request.url, model.endpoint).searchParams
           .get("directory")
-          ?.startsWith(`${tmpdir()}/prb-opencode-v1-`),
+          ?.startsWith(join(tmpdir(), "prb-opencode-v1-")),
       ),
     )
     assert.equal(seen[1].body.variant, "low")

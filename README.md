@@ -217,6 +217,13 @@ unnecessary escalations, so compare both safety errors and format validity.
 Higher reasoning variants may cost more or take longer without always improving
 the result.
 
+On OpenCode V2, a chat review session is created as the agent `reviewer`. Define
+that agent in OpenCode; this plugin does not create it. Quartermaster can bind
+that exact agent id to a plan and replace the session model when the prompt is
+admitted. Until that binding exists, the session keeps the configured `model`.
+Jev reviews do not open this session. OpenCode V1 has no `reviewer` agent on
+its review session.
+
 Free OpenCode Zen models (for example `opencode/big-pickle` or the `*-free`
 IDs) cannot be used as the reviewer: Zen only serves its free tier to OpenCode's
 own clients and rejects the sessions the plugin creates, so every review falls
@@ -293,6 +300,65 @@ the chat-reviewer `confidenceThreshold`.
 Jev escalations. Raising it sends fewer cases to the reasoning reviewer; project
 configuration may raise this value but cannot lower a trusted threshold.
 
+### Quartermaster module routing for Jev
+
+Direct Jev calls can optionally ask the Quartermaster plugin which `opr-jev`
+model to use before the System One request is built. This is off unless the
+trusted global `permission-reviewer.jsonc` opts in. While it is off, including
+`"enabled": false`, Jev keeps using the configured `model` exactly as before.
+Project config, inline plugin options of unknown origin, reviewed prompts,
+commands, and repository evidence cannot enable the route, widen the allowlist,
+or grant permission to call a paid model.
+
+```jsonc
+// ~/.config/opencode/permission-reviewer.jsonc
+{
+  "model": "opencode/jev-1.13-free",
+  "moduleRouting": {
+    "enabled": true,
+    "module": "opr-jev",
+    "allowPaid": true,
+    "models": ["opencode/jev-1.13-free", "opencode/jev-1.13"],
+  },
+}
+```
+
+`module` must be `opr-jev`. `models` is the only allowlist, written as
+`provider/model`, and every entry must be a supported variant-free System One
+Jev route. A model is free only when it is an OpenCode id ending in `-free`.
+Any other allowlisted model requires `"allowPaid": true`. Quartermaster's
+module label is not spending authorization. A recommendation is used only when
+it names `opr-jev`, is on this allowlist, and can be called on the direct
+System One transport. The selected model is the one both the request and the
+structured-response check use.
+
+A valid allow or deny ends this loop. A deny is never retried. Confidence-based
+reasoning escalation is unchanged and still runs only after a valid difficult
+decision, not after a transport failure. The only transport result that may ask
+for another model is a structured System One HTTP 429. The plugin then waits
+until Quartermaster accepts a `rate-limit` report for that exact provider and
+model, asks again, and may call one different permitted model. Both RPC calls
+and both transports share the original review deadline, cancellation signal,
+and evidence snapshot. Authentication failures, cancellation, timeouts, other
+HTTP statuses, and invalid output do not report a cooldown or start the second
+model.
+
+If routing is enabled and Quartermaster is missing or malformed, no model is
+eligible, the candidate is unsupported or disallowed, the same model is
+returned again, the report is not accepted, or the single retry is also rate
+limited, the review fails closed. It does not quietly call the configured free
+Jev model. An invalid trusted `moduleRouting` block is the same kind of
+failure: the direct transport is not called. OpenCode V1 has no Quartermaster
+RPC client, so enabling the route there also fails closed.
+
+A module cooldown is time out of Quartermaster's rotation after an accepted
+report. It is not the review request timeout, not a discovered provider quota
+window, and not a `Retry-After` value. The module RPC budget is two seconds and
+stays inside the original review deadline. Quartermaster stores the configured
+duration; it does not learn the provider's real reset time. The tests mock
+Quartermaster and the System One client. They do not show that a live
+Quartermaster process or a real Jev provider served a review.
+
 ### Reviewer models without structured-output support
 
 Some models (for example `opencode-go/deepseek-v4-flash`) do not support
@@ -338,6 +404,7 @@ Every option is optional. Numeric/string options are clamped to safe bounds.
 | `variant`                      | `medium`                                                  | non-empty string                    | Reasoning variant passed to OpenCode                                                          |
 | `outputFormat`                 | `json_schema`                                             | `json_schema` / `text`              | How the reviewer returns its decision (`text` for models without structured output)           |
 | `escalationReviewer`           | unset                                                     | trusted object                      | Optional reasoning reviewer for valid but difficult Jev decisions                             |
+| `moduleRouting`                | unset                                                     | trusted object                      | Opt-in Quartermaster `opr-jev` allowlist and explicit paid-use permission                     |
 | `timeoutMs`                    | `120000`                                                  | `5000`–`600000`                     | Review timeout; put shared V1 settings in the global config                                   |
 | `confidenceThreshold`          | `0.7`                                                     | `0.5`–`1`                           | Minimum confidence to auto-act; below it escalates                                            |
 | `systemOneConfidenceThreshold` | `0.4`                                                     | `0.3`–`1`                           | Calibrated Jev outcome-confidence floor; below it escalates                                   |
@@ -369,7 +436,7 @@ Config is layered: built-in defaults ← trusted global
 `.opencode/permission-reviewer.jsonc` ← unknown-origin inline plugin options.
 The project layer crosses a trust boundary: it can only **tighten**
 security-sensitive fields, and its hardening survives even when a trusted layer
-set the same field. The project layer cannot choose the reviewer `model`,
+set the same field. The project layer cannot choose the reviewer `model`, `moduleRouting`,
 `escalationReviewer`, `variant`, `outputFormat`, or replace the `policy` text
 (these decide where code/context travels and how the
 reviewer enforces and reports), cannot redirect `auditPath`, flip

@@ -61,9 +61,11 @@ describe("command segments with directory tracking", () => {
     )
     expect(roots).not.toContain(outside)
     expect(roots).not.toContain(join(tempParent, "opencode-symlink"))
-    await chmod(tempPath, 0o777)
-    const writable = await approvedEvidenceRoots("/somewhere", undefined, tempPath)
-    expect(writable).not.toContain(tempPath)
+    if (process.platform !== "win32") {
+      await chmod(tempPath, 0o777)
+      const writable = await approvedEvidenceRoots("/somewhere", undefined, tempPath)
+      expect(writable).not.toContain(tempPath)
+    }
     const notADir = join(tempParent, "plain-file")
     await writeFile(notADir, "x")
     expect(await approvedEvidenceRoots("/somewhere", undefined, notADir)).not.toContain(notADir)

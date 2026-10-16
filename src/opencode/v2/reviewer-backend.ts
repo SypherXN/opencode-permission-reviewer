@@ -21,6 +21,7 @@ import { createIsolatedLocation } from "./isolated-location.ts"
 
 type Context = Parameters<Plugin.Plugin["setup"]>[0]
 const TOOL = "permission_reviewer_result"
+const REVIEWER_AGENT = "reviewer"
 const resultSchema = z
   .object({
     version: z.literal(2),
@@ -263,6 +264,7 @@ export class V2ReviewerBackend {
           {
             id,
             title: "Permission review",
+            agent: REVIEWER_AGENT,
             location: { directory },
             model: {
               id: modelID,
@@ -279,8 +281,12 @@ export class V2ReviewerBackend {
           { signal: attempt.signal },
         ),
       )
-      if (created.id !== id || created.location.directory !== directory)
-        throw new Error("Reviewer session identity or isolation location does not match")
+      if (
+        created.id !== id ||
+        created.agent !== REVIEWER_AGENT ||
+        created.location.directory !== directory
+      )
+        throw new Error("Reviewer session identity, agent, or isolation location does not match")
       const tries = pending.structured ? 3 : 2
       for (let index = 0; index < tries; index++) {
         pending.results = []

@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, test } from "bun:test"
 import { execFile } from "node:child_process"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { promisify } from "node:util"
 import { parseDecision } from "../src/decision.ts"
@@ -149,7 +150,7 @@ describe("stress and adversarial robustness", () => {
   }, 30_000)
 
   test("inspects 500 concurrent local scripts without crossing their contents", async () => {
-    const directory = await mkdtemp("/tmp/opencode/approval-reviewer-script-stress-")
+    const directory = await mkdtemp(join(tmpdir(), "approval-reviewer-script-stress-"))
     try {
       await Promise.all(
         Array.from({ length: 500 }, (_, item) =>
@@ -177,7 +178,7 @@ describe("stress and adversarial robustness", () => {
   }, 30_000)
 
   test("takes 100 concurrent read-only Git snapshots without crossing discard targets", async () => {
-    const directory = await mkdtemp("/tmp/opencode/approval-reviewer-git-stress-")
+    const directory = await mkdtemp(join(tmpdir(), "approval-reviewer-git-stress-"))
     try {
       await execFileAsync("git", ["init", "-b", "stress"], { cwd: directory })
       await execFileAsync("git", ["config", "user.email", "reviewer@example.invalid"], {

@@ -4,6 +4,7 @@ import {
   constants as fsConstants,
   fchmodSync,
   fstatSync,
+  lstatSync,
   openSync,
   readSync,
   writeSync,
@@ -89,6 +90,13 @@ const AUDIT_READ_CAP_BYTES = 64 * 1024 * 1024
 function readTail(path: string): { text: string; truncated: boolean } | undefined {
   let fd: number | undefined
   try {
+    // Where O_NOFOLLOW is absent, lstat is what stops a symlink from being followed.
+    try {
+      const existing = lstatSync(path)
+      if (existing.isSymbolicLink() || !existing.isFile()) return undefined
+    } catch {
+      return undefined
+    }
     // O_NOFOLLOW rejects a symlinked audit path and O_NONBLOCK keeps a FIFO
     // from blocking the CLI before fstat can reject the non-regular file.
     fd = openSync(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW)
@@ -346,6 +354,14 @@ export function createAuditWriter(
 function appendAuditLine(path: string, line: string): void {
   let fd: number | undefined
   try {
+    try {
+      const existing = lstatSync(path)
+      if (existing.isSymbolicLink() || !existing.isFile()) {
+        throw new Error(`not a regular file: ${path}`)
+      }
+    } catch (error) {
+      if ((error as { code?: unknown }).code !== "ENOENT") throw error
+    }
     // One atomic open covers creation and append without a path check or retry.
     // The creation mode closes the umask window before the first record.
     fd = openSync(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_NONBLOCK, 0o600)

@@ -36,6 +36,7 @@ function fixture(
     modelVariants?: string[]
     retain?: boolean
     wrongLocation?: boolean
+    wrongAgent?: boolean
     activationFailed?: boolean
     failFirstActivation?: boolean
     activationDelayed?: boolean
@@ -192,6 +193,7 @@ function fixture(
     session: {
       create: async (input: {
         id: string
+        agent?: string
         location: { directory: string }
         model: { variant?: string }
         permissions: unknown[]
@@ -199,9 +201,11 @@ function fixture(
         sessionID = input.id
         requestedVariant = input.model.variant
         sessionIDs.push(sessionID)
+        expect(input.agent).toBe("reviewer")
         expect(input.permissions[0]).toEqual({ action: "*", resource: "*", effect: "deny" })
         return {
           id: sessionID,
+          agent: options.wrongAgent ? "build" : "reviewer",
           location: { directory: options.wrongLocation ? "/workspace/operational" : directory },
         }
       },
@@ -455,6 +459,7 @@ test("unavailable model, unsupported format or variant, and wrong isolation fail
     { noTools: true },
     { variant: "unsupported" },
     { wrongLocation: true },
+    { wrongAgent: true },
   ]) {
     const harness = fixture(options)
     try {

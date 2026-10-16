@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process"
 import { realpath } from "node:fs/promises"
 import { promisify } from "node:util"
-import { basename, resolve } from "node:path"
+import { basename } from "node:path"
+import { resolveCommandPath } from "./shell-path.ts"
 import type { PermissionRequest } from "./types.ts"
 import { sourceCommand } from "./evidence/source-command.ts"
 import { localExecutableCommand } from "./evidence/local-command.ts"
@@ -198,7 +199,7 @@ function gitExecutionDirectory(
     }
     if (target === undefined) continue
     if (/[$`*?{}<>]/.test(target)) return { reason: "git -C contains unresolved shell expansion" }
-    directory = resolve(directory, target)
+    directory = resolveCommandPath(directory, target)
   }
   return { directory }
 }

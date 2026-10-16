@@ -126,6 +126,23 @@ export interface EscalationReviewerConfig {
   timeoutMs: number
 }
 
+/** One System One model the trusted allowlist permits Quartermaster to choose. */
+export interface ModuleRoutingModel {
+  providerID: string
+  modelID: string
+}
+
+/**
+ * Opt-in route for Quartermaster's `opr-jev` module. Absent means the configured
+ * System One model is called directly, as before.
+ */
+export interface ModuleRoutingConfig {
+  module: "opr-jev"
+  /** Trusted permission to call a non-free model that is also on `models`. */
+  allowPaid: boolean
+  models: readonly ModuleRoutingModel[]
+}
+
 export interface ReviewerConfig {
   model: string
   variant: string
@@ -136,6 +153,10 @@ export interface ReviewerConfig {
   /** Optional reasoning reviewer for valid System One decisions that remain
    *  uncertain or conflict with deterministic review gates. */
   escalationReviewer?: EscalationReviewerConfig
+  /** Trusted opt-in for Quartermaster `opr-jev` selection before a direct Jev call. */
+  moduleRouting?: ModuleRoutingConfig
+  /** Trusted `moduleRouting` was present but invalid, so the direct call must not run. */
+  moduleRoutingRejected?: boolean
   /** Calibrated outcome-confidence floor for System One decisions. */
   systemOneConfidenceThreshold: number
   /** Minimum combined non-escalate probability for routing an explicit

@@ -1,4 +1,11 @@
-import { closeSync, constants as fsConstants, fstatSync, openSync, readSync } from "node:fs"
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+} from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { parseJsoncStrict } from "./jsonc.ts"
@@ -7,7 +14,9 @@ import {
   resolveConfig,
   DEFAULT_CONFIG,
   DEFAULT_RISK_POLICY,
+  isModuleRoutingOptOut,
   isValidEscalationReviewer,
+  isValidModuleRouting,
 } from "../config.ts"
 import type { PolicyRule, ReviewerConfig } from "../types.ts"
 import type { InlineOptionsTrust } from "./sources.ts"
@@ -67,6 +76,12 @@ function readLayerText(path: string): ConfigLayer | { status: "ok"; text: string
   let fd: number | undefined
   try {
     try {
+      const existing = lstatSync(path)
+      if (existing.isSymbolicLink() || !existing.isFile()) {
+        return readError(
+          `permission-reviewer config at ${path} is not a regular file and was ignored`,
+        )
+      }
       // Read-only descriptor open of an existing config path; no file is
       // created here and the descriptor must pass the regular-file check below.
       // codeql[js/insecure-temporary-file]
@@ -242,6 +257,16 @@ export function loadResolvedConfig(
         "permission-reviewer: global config escalationReviewer is invalid and was ignored; automatic approval stays disabled until it is fixed",
       )
     }
+    if (
+      globalLayer.raw.moduleRouting !== undefined &&
+      !isModuleRoutingOptOut(globalLayer.raw.moduleRouting) &&
+      !isValidModuleRouting(globalLayer.raw.moduleRouting)
+    ) {
+      degraded.push("global config moduleRouting is invalid and was ignored")
+      console.warn(
+        "permission-reviewer: global config moduleRouting is invalid and was ignored; automatic approval stays disabled until it is fixed",
+      )
+    }
     const invalidRules = countInvalidPolicyRules(globalLayer.raw.policyRules)
     if (invalidRules > 0) {
       degraded.push(
@@ -299,6 +324,13 @@ export function loadResolvedConfig(
       !isValidEscalationReviewer(inlineOptions.escalationReviewer)
     ) {
       degraded.push("inline config escalationReviewer is invalid and was ignored")
+    }
+    if (
+      inlineOptions.moduleRouting !== undefined &&
+      !isModuleRoutingOptOut(inlineOptions.moduleRouting) &&
+      !isValidModuleRouting(inlineOptions.moduleRouting)
+    ) {
+      degraded.push("inline config moduleRouting is invalid and was ignored")
     }
     const inlineEnforcement = inlineOptions.enforcementMode
     if (
@@ -436,6 +468,9 @@ function mergeWithTrustBoundary(
   // silenced retention must not be selectable from a repository.
   delete clamped.model
   delete clamped.escalationReviewer
+  // moduleRouting chooses paid System One models. A repository, prompt, or
+  // command must not grant that permission or turn the route on or off.
+  delete clamped.moduleRouting
   delete clamped.policy
   delete clamped.variant
   delete clamped.outputFormat

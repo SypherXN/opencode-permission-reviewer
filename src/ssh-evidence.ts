@@ -2,6 +2,7 @@ import { createHash } from "node:crypto"
 import { constants as fsConstants } from "node:fs"
 import { open, lstat, realpath, readlink } from "node:fs/promises"
 import { basename, isAbsolute, resolve, sep } from "node:path"
+import { isCommandAbsolute, resolveCommandPath } from "./shell-path.ts"
 import type { PermissionRequest } from "./types.ts"
 import { commandSegments, sshValueOption } from "./shell-lexer.ts"
 import { sourceCommand } from "./evidence/source-command.ts"
@@ -41,6 +42,10 @@ const SENSITIVE_PATH =
 const SENSITIVE_CONTENT =
   /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\b(?:sk|nvapi)-[A-Za-z0-9_-]{16,}|\b(?:ghp|gho|ghs|ghr|ghu)_[A-Za-z0-9_-]{16,}|\bgithub_pat_[A-Za-z0-9_-]{16,}|\b(?:api[_-]?key|access[_-]?token|password)\s*[:=]\s*["'][^"'\n]{8,}["']/i
 
+function isSensitiveEvidencePath(value: string): boolean {
+  return SENSITIVE_PATH.test(value.replaceAll("\\", "/"))
+}
+
 function sha256(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex")
 }
@@ -71,11 +76,11 @@ function cdTarget(
   if (values.length !== 1) return { reason: "cd target is absent or ambiguous" }
   const target = values[0]!
   if (/[$`*?{}<>]/.test(target)) return { reason: "cd target contains unresolved shell expansion" }
-  if (isAbsolute(target)) return { directory: resolve(target) }
+  if (isCommandAbsolute(target)) return { directory: resolveCommandPath(target) }
   if (directory === undefined) {
     return { reason: "relative cd target follows an unresolved working directory" }
   }
-  return { directory: resolve(directory, target) }
+  return { directory: resolveCommandPath(directory, target) }
 }
 
 export function shellCommandSegmentsWithDirectory(
@@ -84,7 +89,7 @@ export function shellCommandSegmentsWithDirectory(
 ): ShellCommandSegmentWithDirectory[] {
   const segments = shellCommandSegments(command)
   const result: ShellCommandSegmentWithDirectory[] = []
-  let directory: string | undefined = resolve(initialDirectory)
+  let directory: string | undefined = resolveCommandPath(initialDirectory)
   let directoryReason: string | undefined
   let pendingCd:
     { before?: string; beforeReason?: string; target?: string; reason?: string } | undefined
@@ -302,7 +307,9 @@ async function temporaryEvidenceRoot(path: string): Promise<string | undefined> 
       const uid = process.getuid()
       if (typeof info.uid === "number" && info.uid !== uid) return undefined
     }
-    if (info.mode & 0o022) return undefined
+    // Windows reports one mode for every directory, so the Unix
+    // group/other-writable bit cannot identify a private temp root.
+    if (process.platform !== "win32" && info.mode & 0o022) return undefined
     return path
   } catch {
     return undefined
@@ -335,7 +342,7 @@ async function includeFileOnce(
   // (the session's initial directory), the worktree, and /tmp/opencode: a
   // `cd /outside && python x.py` resolves in /outside but stays blocked.
   const resolved = resolve(directory, source)
-  if (SENSITIVE_PATH.test(resolved)) {
+  if (isSensitiveEvidencePath(resolved)) {
     return { source: "file", path: resolved, status: "blocked", reason: "sensitive path" }
   }
 
@@ -352,7 +359,7 @@ async function includeFileOnce(
         reason: "outside approved enrichment roots",
       }
     }
-    if (SENSITIVE_PATH.test(actual)) {
+    if (isSensitiveEvidencePath(actual)) {
       return {
         source: "file",
         path: resolved,
@@ -396,7 +403,7 @@ async function includeFileOnce(
             reason: `open descriptor resolves outside approved enrichment roots (${fdPath})`,
           }
         }
-        if (SENSITIVE_PATH.test(fdPath)) {
+        if (isSensitiveEvidencePath(fdPath)) {
           return {
             source: "file",
             path: resolved,

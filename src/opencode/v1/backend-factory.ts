@@ -35,6 +35,8 @@ export function createV1ReviewerBackend(
   const secondary = secondaryConfig
     ? new V1ReviewerBackend(ctx, secondaryConfig, log, recordReviewerMs)
     : undefined
+  // V1 has no Quartermaster RPC client. Enabled routing fail-closes in the
+  // System One backend instead of calling the configured model directly.
   const primary = new SystemOneReviewerBackend(
     config,
     secondary ? (envelope, attempt) => secondary.review(envelope, attempt) : undefined,

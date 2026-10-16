@@ -1,8 +1,10 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { execFile } from "node:child_process"
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { promisify } from "node:util"
 import { requestCommandCodeCli } from "../lib/command-code-cli.mjs"
 import { validateModel } from "../lib/providers.mjs"
 
@@ -26,35 +28,45 @@ test("Command Code configuration uses a local CLI, not provider API credentials"
   assert.throws(() => validateModel({ ...model, format: "json_schema" }), /text profile/)
 })
 
+const execFileAsync = promisify(execFile)
+
+const fakeCliSource = [
+  'let query = ""',
+  'process.stdin.setEncoding("utf8")',
+  'process.stdin.on("data", (chunk) => { query += chunk })',
+  'process.stdin.on("end", () => {',
+  "  const index = process.argv.findIndex((value) => /(^|[\\\\/])commandcode(\\\\.exe)?$/i.test(value))",
+  "  const args = process.argv.slice(index >= 0 ? index + 1 : 2)",
+  '  const model = args[args.indexOf("--model") + 1]',
+  '  console.log(JSON.stringify({type:"event",event:{type:"model_request_start",model}}))',
+  '  if (process.env.PRB_TEST_FAKE_TOOL === "1")',
+  '    console.log(JSON.stringify({type:"event",event:{type:"tool_running",toolName:"read_file"}}))',
+  "  const finalText = JSON.stringify({",
+  '    system: query.includes("<reviewer_system>\\nSYNTHETIC POLICY"),',
+  '    evidence: query.includes("<permission_request>\\nSYNTHETIC EVIDENCE"),',
+  '    effort: args[args.indexOf("--effort") + 1],',
+  '    noSession: args.includes("--no-session"),',
+  '    noSkills: args.includes("--no-skills"),',
+  "  })",
+  "  console.log(JSON.stringify({",
+  '    type:"result",subtype:"success",stopReason:"end_turn",finalText,',
+  "    usage:{inputTokens:10,outputTokens:5,cacheReadTokens:2},",
+  "  }))",
+  "})",
+  "",
+].join("\n")
+
 async function fakeCli() {
   const directory = await mkdtemp(join(tmpdir(), "prb-command-code-test-"))
+  if (process.platform === "win32") {
+    const script = join(directory, "fake-commandcode.js")
+    const binary = join(directory, "commandcode.exe")
+    await writeFile(script, fakeCliSource)
+    await execFileAsync(process.execPath, ["build", script, "--compile", "--outfile", binary])
+    return { directory, binary }
+  }
   const binary = join(directory, "commandcode")
-  await writeFile(
-    binary,
-    `#!/usr/bin/env node
-let query = ""
-process.stdin.setEncoding("utf8")
-process.stdin.on("data", (chunk) => { query += chunk })
-process.stdin.on("end", () => {
-  const args = process.argv.slice(2)
-  const model = args[args.indexOf("--model") + 1]
-  console.log(JSON.stringify({type:"event",event:{type:"model_request_start",model}}))
-  if (process.env.PRB_TEST_FAKE_TOOL === "1")
-    console.log(JSON.stringify({type:"event",event:{type:"tool_running",toolName:"read_file"}}))
-  const finalText = JSON.stringify({
-    system: query.includes("<reviewer_system>\\nSYNTHETIC POLICY"),
-    evidence: query.includes("<permission_request>\\nSYNTHETIC EVIDENCE"),
-    effort: args[args.indexOf("--effort") + 1],
-    noSession: args.includes("--no-session"),
-    noSkills: args.includes("--no-skills"),
-  })
-  console.log(JSON.stringify({
-    type:"result",subtype:"success",stopReason:"end_turn",finalText,
-    usage:{inputTokens:10,outputTokens:5,cacheReadTokens:2},
-  }))
-})
-`,
-  )
+  await writeFile(binary, `#!/usr/bin/env node\n${fakeCliSource}`)
   await chmod(binary, 0o700)
   return { directory, binary }
 }

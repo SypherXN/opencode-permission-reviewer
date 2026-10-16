@@ -1,4 +1,5 @@
-import { basename, resolve } from "node:path"
+import { basename } from "node:path"
+import { isCommandAbsolute, resolveCommandPath } from "./shell-path.ts"
 import { localExecutableCommand } from "./evidence/local-command.ts"
 import type { PermissionRequest } from "./types.ts"
 import { sourceCommand } from "./evidence/source-command.ts"
@@ -82,11 +83,21 @@ interface InterpreterSpec {
 // scripts or package specifiers, so only separator- or extension-bearing
 // operands are classified as files; anything else conservatively gathers no
 // evidence. Scheme-bearing operands (https:, jsr:, npm:, node:, ...) are
-// remote or package references, not local paths; this also rejects
-// Windows-style drive paths, which never occur in the supported hosts.
+// remote or package references, not local paths. A Windows drive or UNC path
+// is a local file on that host; the scheme test would otherwise treat
+// `C:\task.ts` as the `C:` scheme.
 function pathLikeFileTarget(token: string): boolean {
+  if (
+    process.platform === "win32" &&
+    (/^[A-Za-z]:[\\/]/.test(token) || token.startsWith("\\\\"))
+  )
+    return true
   if (/^[a-z][a-z0-9+.-]*:/i.test(token)) return false
-  return token.includes("/") || /\.(?:[mc]?[jt]sx?)$/i.test(token)
+  return (
+    token.includes("/") ||
+    (process.platform === "win32" && token.includes("\\")) ||
+    /\.(?:[mc]?[jt]sx?)$/i.test(token)
+  )
 }
 
 // Deno permission shorts and require-equals flags never consume the next
@@ -284,11 +295,11 @@ export async function enrichLocalScriptEvidence(
     const interpreter = basename(command[0]!)
     const path = scriptPath(command, 0, interpreter)
     if (!path) continue
-    const key = `${interpreter}\0${segment.directory === undefined && !path.startsWith("/") ? `unresolved:${path}` : resolve(segment.directory ?? directory, path)}`
+    const key = `${interpreter}\0${segment.directory === undefined && !isCommandAbsolute(path) ? `unresolved:${path}` : resolveCommandPath(segment.directory ?? directory, path)}`
     if (seen.has(key)) continue
     seen.add(key)
     const file =
-      segment.directory === undefined && !path.startsWith("/")
+      segment.directory === undefined && !isCommandAbsolute(path)
         ? {
             source: "file" as const,
             path,
