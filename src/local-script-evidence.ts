@@ -87,10 +87,7 @@ interface InterpreterSpec {
 // is a local file on that host; the scheme test would otherwise treat
 // `C:\task.ts` as the `C:` scheme.
 function pathLikeFileTarget(token: string): boolean {
-  if (
-    process.platform === "win32" &&
-    (/^[A-Za-z]:[\\/]/.test(token) || token.startsWith("\\\\"))
-  )
+  if (process.platform === "win32" && (/^[A-Za-z]:[\\/]/.test(token) || token.startsWith("\\\\")))
     return true
   if (/^[a-z][a-z0-9+.-]*:/i.test(token)) return false
   return (

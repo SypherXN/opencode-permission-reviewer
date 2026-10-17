@@ -244,7 +244,13 @@ describe("verified SSH script protocol", () => {
         ].join("\n"),
       )
       await execFileAsync(process.execPath, ["build", sshScript, "--compile", "--outfile", fakeSsh])
-      await execFileAsync(process.execPath, ["build", shellScript, "--compile", "--outfile", fakeShell])
+      await execFileAsync(process.execPath, [
+        "build",
+        shellScript,
+        "--compile",
+        "--outfile",
+        fakeShell,
+      ])
     } else {
       const fakeSsh = join(directory, "ssh")
       await writeFile(fakeSsh, '#!/bin/sh\nfor arg do remote=$arg; done\nexec sh -c "$remote"\n', {

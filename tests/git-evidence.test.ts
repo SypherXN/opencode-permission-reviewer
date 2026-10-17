@@ -101,9 +101,9 @@ describe("Git state evidence enrichment", () => {
     const fakeGitSource = [
       "const index = process.argv.findIndex((value) => /(^|[\\\\/])git(\\\\.exe)?$/i.test(value))",
       "const args = process.argv.slice(index >= 0 ? index + 1 : 2)",
-      "if (args.includes(\"--get-regexp\")) process.exit(1)",
-      "if (args.includes(\"--show-toplevel\")) { console.log(process.cwd()); process.exit(0) }",
-      "if (args.includes(\"status\")) { process.stdout.write(process.env.REVIEWER_SYNTHETIC_GIT_STATUS ?? \"\"); process.exit(0) }",
+      'if (args.includes("--get-regexp")) process.exit(1)',
+      'if (args.includes("--show-toplevel")) { console.log(process.cwd()); process.exit(0) }',
+      'if (args.includes("status")) { process.stdout.write(process.env.REVIEWER_SYNTHETIC_GIT_STATUS ?? ""); process.exit(0) }',
       "process.exit(1)",
     ].join("\n")
     if (process.platform === "win32") {

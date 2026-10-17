@@ -1,4 +1,10 @@
-const HEADERS = ["x-opencode-client", "x-opencode-session", "x-opencode-session-id", "x-session-id", "user-agent"]
+const HEADERS = [
+  "x-opencode-client",
+  "x-opencode-session",
+  "x-opencode-session-id",
+  "x-session-id",
+  "user-agent",
+]
 const LIMIT = 1024 * 1024
 
 /** Inspect a clone only; never return body text, tool arguments, or header values. */
