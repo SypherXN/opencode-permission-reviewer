@@ -17,6 +17,7 @@ import {
   isModuleRoutingOptOut,
   isValidEscalationReviewer,
   isValidModuleRouting,
+  isValidPlanRouting,
 } from "../config.ts"
 import type { PolicyRule, ReviewerConfig } from "../types.ts"
 import type { InlineOptionsTrust } from "./sources.ts"
@@ -268,6 +269,13 @@ export function loadResolvedConfig(
       )
     }
     const invalidRules = countInvalidPolicyRules(globalLayer.raw.policyRules)
+    if (
+      globalLayer.raw.planRouting !== undefined &&
+      !isModuleRoutingOptOut(globalLayer.raw.planRouting) &&
+      !isValidPlanRouting(globalLayer.raw.planRouting)
+    ) {
+      degraded.push("global config planRouting is invalid")
+    }
     if (invalidRules > 0) {
       degraded.push(
         `${invalidRules} policy rule(s) from the global config were dropped by validation`,
@@ -333,6 +341,13 @@ export function loadResolvedConfig(
       degraded.push("inline config moduleRouting is invalid and was ignored")
     }
     const inlineEnforcement = inlineOptions.enforcementMode
+    if (
+      inlineOptions.planRouting !== undefined &&
+      !isModuleRoutingOptOut(inlineOptions.planRouting) &&
+      !isValidPlanRouting(inlineOptions.planRouting)
+    ) {
+      degraded.push("inline config planRouting is invalid")
+    }
     if (
       inlineEnforcement !== undefined &&
       inlineEnforcement !== "enforce" &&
@@ -471,6 +486,8 @@ function mergeWithTrustBoundary(
   // moduleRouting chooses paid System One models. A repository, prompt, or
   // command must not grant that permission or turn the route on or off.
   delete clamped.moduleRouting
+  delete clamped.planRouting
+  delete clamped.planRoutingRejected
   delete clamped.policy
   delete clamped.variant
   delete clamped.outputFormat

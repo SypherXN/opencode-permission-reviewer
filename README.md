@@ -29,7 +29,7 @@ the host and configuration.
 - **Preserves your policy** — `allow` continues, `deny` stays blocked; neither
   ever reaches the reviewer.
 - **Tool-free review**: normal models run in an isolated scratch session with
-  every tool denied; Jev uses its typed System One API, which exposes no tools
+  operational tool execution blocked; Jev uses its typed System One API, which exposes no tools
   or project runtime.
 - **Read-only enrichment** — bounded, sanitized SSH / local-script / Git
   evidence for the reviewer; the filesystem is never modified.
@@ -183,7 +183,10 @@ rejects connections to a different plugin instance. Provider credentials stay
 inside OpenCode. See [Migration and rollback](./MIGRATION.md).
 
 Structured output uses a dedicated schema-validated result tool. All operational
-tools remain disabled. `retainReviewSessions: false` removes the auxiliary
+tools remain blocked from execution and are removed from the reviewer context,
+including `read` and `shell`. Only the structured decision-result tool is retained
+when required by the output format.
+`retainReviewSessions: false` removes the auxiliary
 session; `true` keeps it for inspection. `reviewBudgetMs` bounds the whole
 review; by default it is `2 * timeoutMs + 60000`. Retries consume this budget.
 
@@ -217,17 +220,58 @@ unnecessary escalations, so compare both safety errors and format validity.
 Higher reasoning variants may cost more or take longer without always improving
 the result.
 
-On OpenCode V2, a chat review session is created as the agent `reviewer`. Define
-that agent in OpenCode; this plugin does not create it. Quartermaster can bind
-that exact agent id to a plan and replace the session model when the prompt is
-admitted. Until that binding exists, the session keeps the configured `model`.
-Jev reviews do not open this session. OpenCode V1 has no `reviewer` agent on
-its review session.
+Chat reviews use the configured `model` unless named-plan routing is enabled below.
+The isolated session has an explicit model,
+not an explicit `reviewer` agent. Quartermaster is disabled in that location so
+native agent hooks cannot select a second model. Isolation and tool locks remain.
 
-Free OpenCode Zen models (for example `opencode/big-pickle` or the `*-free`
-IDs) cannot be used as the reviewer: Zen only serves its free tier to OpenCode's
-own clients and rejects the sessions the plugin creates, so every review falls
-back to a manual prompt. Use a paid or subscription model instead.
+Some free Zen models have returned "only available in OpenCode" during review.
+The cause has not been established. Test your chosen model before relying on
+auto-approval.
+
+Chat reviews do not use Quartermaster agent bindings. Jev's optional
+`moduleRouting` remains separate.
+
+### Optional Quartermaster named-plan selection (V2)
+
+Keep a named plan in your Quartermaster settings, for example:
+
+```jsonc
+{ "plans": { "review": ["openai/gpt-6-luna"] } }
+```
+
+Merge this into trusted global `~/.config/opencode/permission-reviewer.jsonc`:
+
+```jsonc
+{
+  "planRouting": {
+    "enabled": true,
+    "plan": "review",
+    "models": ["openai/gpt-6-luna"],
+  },
+}
+```
+
+Before **each new chat reviewer session**, including Jev reasoning escalation,
+OPR calls `quartermaster.selectPlan({ plan: "review" })` in the originating
+location. No agent definition or binding is needed. OPR applies the selected
+provider/model and optional variant itself, retaining isolation and tool locks.
+Without a returned variant, the configured reviewer variant applies. Unsupported
+variants fail closed. Keep `escalationReviewer` configured to enable Jev's second
+opinion; primary Jev selection still uses `moduleRouting`, not this plan.
+
+`models` is a trusted exact allowlist: listing a model authorizes paid use and
+sending review evidence to it. Project settings cannot enable or change routing.
+Unknown plans, no eligible model, missing RPC, malformed responses, cancellation,
+or a 2-second RPC timeout stop the review through `escalationMode`; there is no
+silent static fallback. Selection is advice only: no reservations, provider
+failure reports, or automatic model retries. V1 rejects enabled plan routing.
+
+Omit `planRouting` or use `{ "enabled": false }` to avoid QM entirely for chat:
+primary chat uses `model`, and Jev reasoning uses `escalationReviewer.model`.
+The RPC client uses the published wire contract without importing a private local
+Quartermaster package. Restart the receiving OpenCode process after updating QM
+to a build with `selectPlan`; no real provider call is needed to test that RPC.
 
 ### Jev System One reviewer
 
@@ -702,9 +746,11 @@ binary, blocked, or truncated evidence) remains a reviewer decision.
   some V2 host failures deny directly.
 - Known common credential formats are redacted from reviewer evidence. Redaction
   is defense in depth, not a guarantee that every possible secret is detected.
-- Reviewer sessions cannot request permissions recursively; every tool is
-  denied by a wildcard session permission rule that also covers MCP tools and
-  takes precedence over agent-config allows.
+- Reviewer sessions cannot request permissions recursively. Wildcard session
+  denial covers operational tools and MCP tools. An independent V2
+  execution hook rejects every operational tool, including `read` and `shell`,
+  before permission evaluation or I/O.
+  Only the structured decision tool may execute.
 - The reviewer session runs outside the project directory, so repository
   instructions (`AGENTS.md` and project-config `instructions`) are not part of
   its system prompt; if the isolated directory cannot be established, the

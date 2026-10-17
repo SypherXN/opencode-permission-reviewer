@@ -310,6 +310,8 @@ export function resolveConfig(options: Record<string, unknown> | undefined): Rev
   const outputFormat = source.outputFormat === "text" ? "text" : "json_schema"
   const escalationReviewer = resolveEscalationReviewer(source.escalationReviewer)
   const moduleRoute = resolveModuleRouting(source.moduleRouting)
+  const planRoute = source.planRouting
+  const planOff = planRoute === undefined || isModuleRoutingOptOut(planRoute)
   const policy =
     typeof source.policy === "string" && source.policy.trim().length > 0
       ? source.policy.trim()
@@ -323,6 +325,10 @@ export function resolveConfig(options: Record<string, unknown> | undefined): Rev
     model,
     variant,
     outputFormat,
+    ...(!planOff && isValidPlanRouting(planRoute)
+      ? { planRouting: { plan: planRoute.plan, models: planRoute.models } }
+      : {}),
+    ...(!planOff && !isValidPlanRouting(planRoute) ? { planRoutingRejected: true } : {}),
     ...(escalationReviewer === undefined ? {} : { escalationReviewer }),
     ...(moduleRoute.moduleRouting === undefined
       ? {}
@@ -469,6 +475,28 @@ export function splitModel(model: string): { providerID: string; modelID: string
 }
 
 const MODULE_ROUTING_KEYS = ["allowPaid", "enabled", "models", "module"]
+
+export function isValidPlanRouting(value: unknown): value is {
+  enabled: true
+  plan: string
+  models: string[]
+} {
+  if (!plainObject(value) || value.enabled !== true) return false
+  if (Object.keys(value).sort().join(",") !== "enabled,models,plan") return false
+  if (typeof value.plan !== "string" || !value.plan.trim() || value.plan.length > 256) return false
+  if (value.plan.trim() !== value.plan) return false
+  if (!Array.isArray(value.models) || !value.models.length) return false
+  if (new Set(value.models).size !== value.models.length) return false
+  return value.models.every((model) => {
+    if (typeof model !== "string" || !model || model.trim() !== model) return false
+    try {
+      splitModel(model)
+    } catch {
+      return false
+    }
+    return !isSystemOneReviewerModel(model)
+  })
+}
 
 function plainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)

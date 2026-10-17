@@ -4,7 +4,8 @@ import { readFile, rm } from "node:fs/promises"
 import { pathToFileURL } from "node:url"
 import type { OpenCodeClient } from "@opencode/client"
 import type { Plugin } from "@opencode/plugin"
-import { V2ReviewerBackend } from "../src/opencode/v2/reviewer-backend.ts"
+import { createV2ReviewerBackend } from "../src/opencode/v2/backend-factory.ts"
+import { SYSTEM_ONE_QUESTIONS } from "../src/system-one/review.ts"
 import { DEFAULT_CONFIG } from "../src/config.ts"
 import { ReviewAttempt } from "../src/core/review-attempt.ts"
 import type { ReviewEnvelope, ReviewerConfig } from "../src/types.ts"
@@ -36,7 +37,11 @@ function fixture(
     modelVariants?: string[]
     retain?: boolean
     wrongLocation?: boolean
-    wrongAgent?: boolean
+    activeQuartermaster?: boolean
+    planRouting?: ReviewerConfig["planRouting"]
+    planRoutingRejected?: boolean
+    selection?: unknown
+    systemOne?: boolean
     activationFailed?: boolean
     failFirstActivation?: boolean
     activationDelayed?: boolean
@@ -50,6 +55,8 @@ function fixture(
   let toolHook!: (event: { sessionID: string; tool: string }) => void
   let directory = ""
   let requestedVariant: string | undefined
+  let requestedModel: unknown
+  const rpcCalls: unknown[] = []
   const directories: string[] = []
   const activated = new Set<string>()
   let sessionID = ""
@@ -80,6 +87,15 @@ function fixture(
   }
   const ctx = {
     location: { directory: "/workspace/operational" },
+    rpc: (definition: { id: string }) => ({
+      selectPlan: async (input: unknown) => {
+        expect(definition.id).toBe("quartermaster")
+        expect(sessionIDs).toHaveLength(rpcCalls.length)
+        rpcCalls.push(input)
+        if (!options.planRouting) throw new Error("Static reviews must not query Quartermaster")
+        return options.selection
+      },
+    }),
     tool: {
       transform: async (callback: (editor: { add(definition: Tool): void }) => void) => {
         callback({
@@ -141,6 +157,9 @@ function fixture(
                 : directory + "/index.js"
         return {
           data: [
+            ...(options.activeQuartermaster
+              ? [{ id: "quartermaster", state: { status: "active" } }]
+              : []),
             {
               id: pluginID,
               source:
@@ -157,14 +176,12 @@ function fixture(
       list: async () => ({
         data: options.missingModel
           ? []
-          : [
-              {
-                providerID: "fixture",
-                id: "reviewer",
-                capabilities: { tools: !options.noTools },
-                variants: (options.modelVariants ?? ["max"]).map((id) => ({ id })),
-              },
-            ],
+          : ["reviewer", "selected"].map((id) => ({
+              providerID: "fixture",
+              id,
+              capabilities: { tools: !options.noTools },
+              variants: (options.modelVariants ?? ["max"]).map((id) => ({ id })),
+            })),
       }),
     },
     mcp: {
@@ -200,29 +217,58 @@ function fixture(
       }) => {
         sessionID = input.id
         requestedVariant = input.model.variant
+        requestedModel = input.model
         sessionIDs.push(sessionID)
-        expect(input.agent).toBe("reviewer")
+        expect(input.agent).toBeUndefined()
         expect(input.permissions[0]).toEqual({ action: "*", resource: "*", effect: "deny" })
+        for (const action of ["read", "shell"])
+          expect(input.permissions).not.toContainEqual({ action, resource: "*", effect: "ask" })
         return {
           id: sessionID,
-          agent: options.wrongAgent ? "build" : "reviewer",
+          agent: "build",
           location: { directory: options.wrongLocation ? "/workspace/operational" : directory },
         }
       },
       prompt: async ({ sessionID: current }: { sessionID: string }) => {
         prompts++
+        const readDefinition = { description: "Native read schema" }
+        const shellDefinition = { description: "Native shell schema" }
         const event: ContextEvent = {
           sessionID: current,
           system: ["UNTRUSTED_SYSTEM"],
           messages: ["UNTRUSTED_HISTORY"],
-          tools: { permission_reviewer_result: tool, shell: {} },
+          tools: {
+            permission_reviewer_result: tool,
+            read: readDefinition,
+            shell: shellDefinition,
+            execute: {},
+            edit: {},
+          },
         }
         contextHook(event)
         messagesBySession.set(current, JSON.stringify(event.messages))
         expect(JSON.stringify(event.system)).not.toContain("UNTRUSTED_SYSTEM")
         expect(JSON.stringify(event.messages)).not.toContain("UNTRUSTED_HISTORY")
         expect(event.tools.shell).toBeUndefined()
+        expect(event.tools.execute).toBeUndefined()
+        expect(event.tools.edit).toBeUndefined()
+        expect(event.tools.read).toBeUndefined()
+        for (const prompt of [event.system, event.messages])
+          expect(JSON.stringify(prompt)).toContain("Do not call read, shell")
+        // Model dispatch must pass execute.before before any permission request or file access.
+        for (const name of ["read", "shell"]) {
+          let executed = false
+          let permissionRequested = false
+          expect(() => {
+            toolHook({ sessionID: current, tool: name })
+            permissionRequested = true
+            executed = true
+          }).toThrow("Operational tools")
+          expect(executed).toBe(false)
+          expect(permissionRequested).toBe(false)
+        }
         expect(() => toolHook({ sessionID: current, tool: "shell" })).toThrow("Operational tools")
+        expect(() => toolHook({ sessionID: current, tool: "execute" })).toThrow("Operational tools")
         if (options.format !== "text" && !options.invalid) {
           await tool.execute(tool.input.parse(decision("allow")), { sessionID: current })
           if (options.ambiguous)
@@ -270,13 +316,26 @@ function fixture(
       },
     },
   } as unknown as OpenCodeClient
-  const backend = new V2ReviewerBackend(
+  const backend = createV2ReviewerBackend(
     ctx,
     config({
       model: "fixture/reviewer",
       variant: options.variant ?? "max",
       outputFormat: options.format ?? "json_schema",
       retainReviewSessions: options.retain ?? false,
+      ...(options.planRouting ? { planRouting: options.planRouting } : {}),
+      ...(options.planRoutingRejected ? { planRoutingRejected: true } : {}),
+      ...(options.systemOne
+        ? {
+            model: "opencode/jev-1.13-free",
+            escalationReviewer: {
+              model: "fixture/reviewer",
+              variant: "max",
+              outputFormat: options.format ?? "json_schema",
+              timeoutMs: 5000,
+            },
+          }
+        : {}),
     }),
   )
   const envelope: ReviewEnvelope = {
@@ -306,6 +365,8 @@ function fixture(
       sessionIDs,
       removed: removed.has(sessionID),
       requestedVariant,
+      requestedModel,
+      rpcCalls,
       messagesBySession,
       prompts,
       mcpLists,
@@ -349,6 +410,7 @@ test("isolated structured and text backends preserve scope, variant, and retenti
       expect((await harness.run()).kind).toBe("allow")
       const state = harness.state()
       expect(state.prompts).toBe(1)
+      expect(state.rpcCalls).toEqual([])
       expect(state.removed).toBe(format !== "text")
       expect(state.disposed).toBe(0)
       expect(harness.backend.owns(state.sessionID)).toBe(false)
@@ -357,6 +419,130 @@ test("isolated structured and text backends preserve scope, variant, and retenti
     } finally {
       await harness.cleanup()
     }
+  }
+})
+
+const planRouting = { plan: "review", models: ["fixture/selected"] }
+const planSelection = {
+  apiVersion: 1,
+  status: "selected",
+  reasonCode: "first-eligible",
+  reason: "Selected",
+  skipped: [],
+  plan: { id: "review", source: "named-plan", reasonCode: "named-plan" },
+  selected: { providerID: "fixture", modelID: "selected", variant: "max" },
+}
+
+test("named plan is queried before each new reviewer without assigning an agent", async () => {
+  const harness = fixture({ planRouting, selection: planSelection })
+  try {
+    for (let i = 0; i < 2; i++) {
+      const result = await harness.run()
+      expect(result.kind).toBe("allow")
+      expect(result.reviewerModel).toBe("fixture/selected")
+    }
+    expect(harness.state().rpcCalls).toEqual([{ plan: "review" }, { plan: "review" }])
+    expect(harness.state().requestedModel).toEqual({
+      providerID: "fixture",
+      id: "selected",
+      variant: "max",
+    })
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("named plan failures never create a reviewer or use the static model", async () => {
+  for (const selection of [
+    {},
+    { ...planSelection, status: "no-plan" },
+    { ...planSelection, status: "no-eligible" },
+    { ...planSelection, apiVersion: 2 },
+    { ...planSelection, plan: { ...planSelection.plan, id: "other" } },
+    { ...planSelection, selected: { providerID: "fixture", modelID: "reviewer" } },
+    { ...planSelection, selected: { providerID: "fixture/selected", modelID: "" } },
+    { ...planSelection, selected: { ...planSelection.selected, variant: "unsupported" } },
+  ]) {
+    const harness = fixture({ planRouting, selection })
+    try {
+      expect((await harness.run()).kind).toBe("escalate")
+      expect(harness.state().sessionIDs).toEqual([])
+    } finally {
+      await harness.cleanup()
+    }
+  }
+})
+
+test("Jev reasoning escalation uses its configured model without agent routing", async () => {
+  const previousKey = process.env.OPENCODE_API_KEY
+  const previousFetch = globalThis.fetch
+  process.env.OPENCODE_API_KEY = "synthetic-opencode-key"
+  let fetches = 0
+  const answers = Object.fromEntries(
+    Object.entries(SYSTEM_ONE_QUESTIONS).map(([name, question]) => {
+      if (question.type === "noul")
+        return [
+          name,
+          {
+            type: "noul",
+            noul: ["material_authorization", "within_intent_scope"].includes(name) ? 1 : 0,
+          },
+        ]
+      const keys = Object.keys(question.criteria)
+      const selected = name === "outcome" ? "escalate" : keys[0]
+      const confidence = name === "outcome" ? 0.6 : 1
+      return [
+        name,
+        {
+          type: "choice",
+          choice: selected,
+          confidence,
+          probabilities: Object.fromEntries(
+            keys.map((key) => [
+              key,
+              key === selected ? confidence : (1 - confidence) / (keys.length - 1),
+            ]),
+          ),
+        },
+      ]
+    }),
+  )
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    expect(JSON.parse(String(init?.body)).model).toBe("jev-1.13-free")
+    fetches++
+    return Response.json({ model: "jev-1.13-free", answers })
+  }) as typeof fetch
+  try {
+    for (const routed of [false, true]) {
+      const harness = fixture({
+        systemOne: true,
+        ...(routed ? { planRouting, selection: planSelection } : {}),
+      })
+      try {
+        const result = await harness.run()
+        const state = harness.state()
+        expect(result.kind).toBe("allow")
+        expect(result.reviewerEscalatedFrom?.model).toBe("opencode/jev-1.13-free")
+        expect(state.rpcCalls).toEqual(routed ? [{ plan: "review" }] : [])
+        expect(state.prompts).toBe(1)
+        expect(state.sessionIDs).toHaveLength(1)
+        {
+          expect(result.reviewerModel).toBe(routed ? "fixture/selected" : "fixture/reviewer")
+          expect(state.requestedModel).toEqual({
+            providerID: "fixture",
+            id: routed ? "selected" : "reviewer",
+            variant: "max",
+          })
+        }
+      } finally {
+        await harness.cleanup()
+      }
+    }
+    expect(fetches).toBe(2)
+  } finally {
+    globalThis.fetch = previousFetch
+    if (previousKey === undefined) delete process.env.OPENCODE_API_KEY
+    else process.env.OPENCODE_API_KEY = previousKey
   }
 })
 
@@ -459,7 +645,7 @@ test("unavailable model, unsupported format or variant, and wrong isolation fail
     { noTools: true },
     { variant: "unsupported" },
     { wrongLocation: true },
-    { wrongAgent: true },
+    { activeQuartermaster: true },
   ]) {
     const harness = fixture(options)
     try {
@@ -521,7 +707,11 @@ test("review sessions share one MCP-free location without mixing concurrent evid
     })
     expect(new Set(markers)).toEqual(new Set(commands))
     const isolatedConfig = JSON.parse(await readFile(state.directory + "/opencode.json", "utf8"))
-    expect(isolatedConfig.plugins).toEqual(["-opencode.config.mcp", state.directory])
+    expect(isolatedConfig.plugins).toEqual([
+      "-opencode.config.mcp",
+      "-quartermaster",
+      state.directory,
+    ])
     expect((await harness.run("Review one more unique marker")).kind).toBe("allow")
     expect(harness.state().directory).toBe(state.directory)
     expect(harness.state().setups).toBe(1)

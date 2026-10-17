@@ -61,7 +61,8 @@ export async function createIsolatedLocation(
     )
     await writeFile(
       join(directory, "opencode.json"),
-      JSON.stringify({ plugins: ["-opencode.config.mcp", directory] }),
+      // Keep the explicit reviewer model unchanged by inherited QM agent hooks.
+      JSON.stringify({ plugins: ["-opencode.config.mcp", "-quartermaster", directory] }),
       { flag: "wx", mode: 0o600 },
     )
     directories.add(directory)

@@ -544,4 +544,25 @@ describe("config loader — trust boundary", () => {
       rmSync(globalConfigPath(), { force: true })
     }
   })
+
+  test("project config cannot enable or override trusted named-plan routing", () => {
+    const dir = mkdtempSync(join(tmpdir(), "reviewer-cfg-"))
+    try {
+      mkdirSync(join(dir, ".opencode"), { recursive: true })
+      const trusted = { enabled: true, plan: "review", models: ["fixture/model"] }
+      for (const planRouting of [{ ...trusted, plan: "other" }, { enabled: false }]) {
+        writeFileSync(projectConfigPath(dir), JSON.stringify({ planRouting }))
+        expect(loadResolvedConfig(undefined, dir).planRouting).toBeUndefined()
+        expect(loadResolvedConfig({ planRouting: trusted }, dir).planRouting).toEqual({
+          plan: "review",
+          models: ["fixture/model"],
+        })
+      }
+      expect(
+        loadResolvedConfig({ planRouting: trusted }, undefined, "unknown").planRouting,
+      ).toBeUndefined()
+    } finally {
+      rmSync(dir, { recursive: true })
+    }
+  })
 })

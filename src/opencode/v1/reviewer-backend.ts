@@ -284,6 +284,8 @@ export class V1ReviewerBackend {
     let sessionDirectory: string | undefined
 
     try {
+      if (this.config.planRouting || this.config.planRoutingRejected)
+        throw new Error("Quartermaster named-plan routing requires OpenCode V2")
       // Never review inside the project if instruction isolation fails.
       const isolated = await attempt.wait(this.reviewerSessionDirectory())
       // The isolated location excludes MCP via its local config, but the guard

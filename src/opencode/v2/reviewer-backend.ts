@@ -18,10 +18,13 @@ import { applyEscalationDisposition } from "../../escalation.ts"
 import { formatFailureReason } from "../../failure-reason.ts"
 import { DEFAULT_CONFIG, splitModel } from "../../config.ts"
 import { createIsolatedLocation } from "./isolated-location.ts"
+import { selectPlanModel } from "./plan-routing.ts"
+import { captureRequestTools } from "./request-diagnostics.ts"
 
 type Context = Parameters<Plugin.Plugin["setup"]>[0]
 const TOOL = "permission_reviewer_result"
-const REVIEWER_AGENT = "reviewer"
+const EVIDENCE_ONLY =
+  "Use only the supplied evidence. Do not call read, shell, or any other operational tool, even if its definition is visible. Their execution is blocked. Do not fetch files or additional context. If essential evidence is missing, escalate. Only the designated decision-result tool may be used when required by the output format."
 const resultSchema = z
   .object({
     version: z.literal(2),
@@ -106,6 +109,8 @@ export class V2ReviewerBackend {
               type: "text",
               text:
                 REVIEWER_SYSTEM_PROMPT +
+                "\n" +
+                EVIDENCE_ONLY +
                 (pending.structured
                   ? `\nReturn the decision using ${TOOL} exactly once, then stop.`
                   : ""),
@@ -119,6 +124,24 @@ export class V2ReviewerBackend {
               : {}
         }),
       )
+      if (this.config.debug) {
+        registrations.push(
+          await ctx.session.hook("http.request", async (event) => {
+            const pending = this.sessions.get(event.sessionID)
+            if (!pending?.attempt.active() || pending.closing) return
+            const capture = await captureRequestTools(event.request)
+            console.error(
+              "permission-reviewer request-tools " +
+                JSON.stringify({
+                  sessionID: event.sessionID,
+                  model: event.model,
+                  kind: event.kind,
+                  ...capture,
+                }),
+            )
+          }),
+        )
+      }
       registrations.push(
         await ctx.tool.hook("execute.before", (event) => {
           const pending = this.sessions.get(event.sessionID)
@@ -218,10 +241,15 @@ export class V2ReviewerBackend {
     attempt: ReviewAttempt,
     client: OpenCodeClient,
   ): Promise<ReviewExecutionResult> {
-    const { providerID, modelID } = splitModel(this.config.model)
     const id = `ses_${randomBytes(16).toString("hex")}`
     let createIssued = false
     try {
+      if (this.config.planRoutingRejected) throw new Error("Trusted planRouting config is invalid")
+      const selection: { providerID: string; modelID: string; variant?: string } = this.config
+        .planRouting
+        ? await attempt.wait(selectPlanModel(this.ctx, this.config, attempt.signal))
+        : splitModel(this.config.model)
+      const { providerID, modelID } = selection
       const { directory } = await attempt.wait(this.ensureLocation(client))
       const inventory = await attempt.wait(
         client.mcp.list({ location: { directory } }, { signal: attempt.signal }),
@@ -237,8 +265,11 @@ export class V2ReviewerBackend {
         (item) => item.providerID === providerID && item.id === modelID,
       )
       if (!model) throw new Error("Reviewer model is unavailable")
+      const plannedVariant = selection.variant
+      if (plannedVariant && !(model.variants ?? []).some((item) => item.id === plannedVariant))
+        throw new Error("Quartermaster selected an unavailable reviewer variant")
       const variant = selectVariant(
-        this.config.variant,
+        plannedVariant ?? this.config.variant,
         (model.variants ?? []).map((item) => item.id),
       )
       if (this.config.outputFormat === "json_schema" && !model.capabilities.tools) {
@@ -249,11 +280,14 @@ export class V2ReviewerBackend {
         envelope.actionEvidenceComplete !== false && evidence.actionEvidenceComplete
       const pending: PendingGeneration = {
         attempt,
-        prompt: buildReviewerPrompt(
-          this.config.policy ?? DEFAULT_TENANT_POLICY,
-          evidence.text,
-          this.config.outputFormat,
-        ),
+        prompt:
+          EVIDENCE_ONLY +
+          "\n\n" +
+          buildReviewerPrompt(
+            this.config.policy ?? DEFAULT_TENANT_POLICY,
+            evidence.text,
+            this.config.outputFormat,
+          ),
         structured: this.config.outputFormat === "json_schema",
         results: [],
       }
@@ -264,7 +298,6 @@ export class V2ReviewerBackend {
           {
             id,
             title: "Permission review",
-            agent: REVIEWER_AGENT,
             location: { directory },
             model: {
               id: modelID,
@@ -281,12 +314,8 @@ export class V2ReviewerBackend {
           { signal: attempt.signal },
         ),
       )
-      if (
-        created.id !== id ||
-        created.agent !== REVIEWER_AGENT ||
-        created.location.directory !== directory
-      )
-        throw new Error("Reviewer session identity, agent, or isolation location does not match")
+      if (created.id !== id || created.location.directory !== directory)
+        throw new Error("Reviewer session identity or isolation location does not match")
       const tries = pending.structured ? 3 : 2
       for (let index = 0; index < tries; index++) {
         pending.results = []
@@ -337,6 +366,7 @@ export class V2ReviewerBackend {
             ...enforceDecision(parsed, this.config),
             reviewSessionID: id,
             decisionSource: "llm-reviewer",
+            reviewerModel: `${providerID}/${modelID}`,
           }
         pending.prompt +=
           "\nThe prior response was invalid. Return exactly one valid decision using the requested format."
@@ -427,6 +457,14 @@ async function waitForIsolationActive(
   const root = resolve(directory)
   for (;;) {
     const plugins = await client.plugin.list({ location: { directory } }, { signal })
+    if (
+      plugins.data.some(
+        (plugin) =>
+          (plugin as unknown as { id?: unknown }).id === "quartermaster" &&
+          plugin.state.status === "active",
+      )
+    )
+      throw new Error("Quartermaster must be disabled in the reviewer isolation location")
     const entry = plugins.data.find((plugin) => {
       if (plugin.source.type !== "local") return false
       if ((plugin as unknown as { id?: unknown }).id === pluginID) return true

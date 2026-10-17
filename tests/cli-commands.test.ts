@@ -18,7 +18,7 @@ function run(
     cwd: CWD,
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env, ...env },
+    env: { ...process.env, ...(env?.HOME ? { USERPROFILE: env.HOME } : {}), ...env },
   })
   return Promise.all([
     proc.exited,

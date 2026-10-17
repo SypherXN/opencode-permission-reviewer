@@ -145,6 +145,9 @@ export interface ModuleRoutingConfig {
 
 export interface ReviewerConfig {
   model: string
+  /** Trusted opt-in named-plan selection; listed models authorize evidence delivery. */
+  planRouting?: { plan: string; models: readonly string[] }
+  planRoutingRejected?: boolean
   variant: string
   /** How the reviewer model returns its decision. `json_schema` requests
    *  OpenCode's structured-output format (requires provider support); `text`
