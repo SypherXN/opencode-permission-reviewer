@@ -26,6 +26,15 @@ Actions the reviewer classifies as critical are not auto-approved. Failures do
 not become new approvals: they lead to manual review or denial, depending on
 the host and configuration.
 
+### Why this fork uses Quartermaster
+
+This fork can ask Quartermaster for a model from a trusted named plan for each
+chat review, while keeping model validation and the permission decision in OPR.
+Jev's primary review uses a separate module profile so its cooldown handling
+does not get mixed with chat-plan selection. See the
+[fork notes](./QUARTERMASTER_FORK.md) for how this differs from upstream
+OPR and the limits of the integration.
+
 - **Preserves your policy** — `allow` continues, `deny` stays blocked; neither
   ever reaches the reviewer.
 - **Tool-free review**: normal models run in an isolated scratch session with
