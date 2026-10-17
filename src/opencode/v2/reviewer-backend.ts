@@ -23,8 +23,6 @@ import { captureRequestTools } from "./request-diagnostics.ts"
 
 type Context = Parameters<Plugin.Plugin["setup"]>[0]
 const TOOL = "permission_reviewer_result"
-const EVIDENCE_ONLY =
-  "Use only the supplied evidence. Do not call read, shell, or any other operational tool, even if its definition is visible. Their execution is blocked. Do not fetch files or additional context. If essential evidence is missing, escalate. Only the designated decision-result tool may be used when required by the output format."
 const resultSchema = z
   .object({
     version: z.literal(2),
@@ -109,8 +107,6 @@ export class V2ReviewerBackend {
               type: "text",
               text:
                 REVIEWER_SYSTEM_PROMPT +
-                "\n" +
-                EVIDENCE_ONLY +
                 (pending.structured
                   ? `\nReturn the decision using ${TOOL} exactly once, then stop.`
                   : ""),
@@ -280,14 +276,11 @@ export class V2ReviewerBackend {
         envelope.actionEvidenceComplete !== false && evidence.actionEvidenceComplete
       const pending: PendingGeneration = {
         attempt,
-        prompt:
-          EVIDENCE_ONLY +
-          "\n\n" +
-          buildReviewerPrompt(
-            this.config.policy ?? DEFAULT_TENANT_POLICY,
-            evidence.text,
-            this.config.outputFormat,
-          ),
+        prompt: buildReviewerPrompt(
+          this.config.policy ?? DEFAULT_TENANT_POLICY,
+          evidence.text,
+          this.config.outputFormat,
+        ),
         structured: this.config.outputFormat === "json_schema",
         results: [],
       }

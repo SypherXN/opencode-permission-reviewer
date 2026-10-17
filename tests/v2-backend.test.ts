@@ -254,7 +254,7 @@ function fixture(
         expect(event.tools.edit).toBeUndefined()
         expect(event.tools.read).toBeUndefined()
         for (const prompt of [event.system, event.messages])
-          expect(JSON.stringify(prompt)).toContain("Do not call read, shell")
+          expect(JSON.stringify(prompt)).not.toContain("Do not call read, shell")
         // Model dispatch must pass execute.before before any permission request or file access.
         for (const name of ["read", "shell"]) {
           let executed = false
