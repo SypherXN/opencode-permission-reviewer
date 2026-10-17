@@ -9,15 +9,12 @@ from pathlib import Path
 import urllib.request
 import urllib.parse
 
+import hosts
 from test_v2_reviewer import model_server  # noqa: F401, shared synthetic HTTP provider
 
 import pytest
 
-V1_VERSIONS = (
-    [os.environ["V1_HOST_VERSION"]]
-    if os.environ.get("V1_HOST_VERSION")
-    else ["1.18.29", "1.18.30", "1.18.31", "1.18.32", "1.19.0"]
-)
+V1_VERSIONS = hosts.pinned("v1")
 
 @pytest.mark.parametrize("version", V1_VERSIONS)
 def test_v1_isolated_server(launch_host, activate_host, probe_package, version):
