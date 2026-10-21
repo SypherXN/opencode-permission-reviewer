@@ -1,4 +1,4 @@
-import { basename, dirname, join } from "node:path"
+import { basename, dirname, join, resolve } from "node:path"
 import { lstat } from "node:fs/promises"
 import type { PermissionRequest } from "./types.ts"
 import { sourceCommand } from "./evidence/source-command.ts"
@@ -78,6 +78,19 @@ function invocation(tokens: string[]): ScriptInvocation | undefined {
       ? { unresolved: "runtime directory or workspace selection is not resolved" }
       : {}),
   }
+}
+
+/** The directory the host runs the shell command in. A relative workdir resolves
+ *  against the session directory, as the host does. An unusable one is undefined
+ *  so another directory's manifest is never reported as the target. */
+function shellWorkdir(request: PermissionRequest, directory: string): string | undefined {
+  const input = request.metadata.toolInput
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return directory
+  const workdir = (input as Record<string, unknown>).workdir
+  if (workdir === undefined || (typeof workdir === "string" && workdir.trim() === ""))
+    return directory
+  if (typeof workdir !== "string" || workdir.includes("\0")) return
+  return resolve(directory, workdir)
 }
 
 /** Read manifest definitions and literal local calls; never execute package code. */
@@ -266,8 +279,14 @@ export async function enrichPackageScriptEvidence(
     }
     active.delete(key)
   }
-  for (const segment of shellCommandSegmentsWithDirectory(sourceCommand(request), directory)) {
-    for (const call of calls(segment.tokens)) await visit(call, segment.directory, 0)
+  // The workdir only selects the starting manifest; reads stay within the approved roots.
+  const workdir = shellWorkdir(request, directory)
+  for (const segment of shellCommandSegmentsWithDirectory(
+    sourceCommand(request),
+    workdir ?? directory,
+  )) {
+    for (const call of calls(segment.tokens))
+      await visit(call, workdir === undefined ? undefined : segment.directory, 0)
   }
   if (records.length === 0) return { text: "" }
   const serialize = () =>

@@ -29,6 +29,42 @@ async function evidence(directory: string, command: string, maxChars = 24000) {
   ).text
 }
 
+test("the shell workdir selects the manifest without widening the read roots", async () => {
+  const directory = await fixture({ typecheck: "printf root-project" })
+  await mkdir(join(directory, "packages", "app"), { recursive: true })
+  await writeFile(
+    join(directory, "packages", "app", "package.json"),
+    JSON.stringify({ scripts: { typecheck: "printf app-project" } }),
+  )
+  const outside = await fixture({ typecheck: "printf outside-root" })
+  const collect = async (workdir: unknown) =>
+    (
+      await enrichPackageScriptEvidence(
+        request({
+          metadata: { command: "bun run typecheck", toolInput: { command: "x", workdir } },
+        }),
+        directory,
+        directory,
+        24000,
+      )
+    ).text
+
+  for (const workdir of [undefined, "", ".", directory]) {
+    expect(await collect(workdir)).toContain("printf root-project")
+  }
+  for (const workdir of ["packages/app", join(directory, "packages", "app")]) {
+    const text = await collect(workdir)
+    expect(text).toContain("printf app-project")
+    expect(text).not.toContain("printf root-project")
+  }
+  for (const workdir of [12, null, ["packages/app"], "packages/\0app"]) {
+    const text = await collect(workdir)
+    expect(text).toContain("script working directory is unresolved")
+    expect(text).not.toContain("printf root-project")
+  }
+  expect(await collect(outside)).not.toContain("printf outside-root")
+})
+
 test("manifest evidence resolves bounded local script chains and referenced code", async () => {
   const directory = await fixture({
     check: "bun run lint && bun run verify",
