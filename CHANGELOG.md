@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Liquid AI `liquid-ai/d1` and `liquid-ai/d1-ultra` as System One reviewer
+  models, with the key read from `LIQUID_API_KEY`. A key that is not shaped
+  like a Liquid AI key (`liquid_` prefix) is never sent; the review follows the
+  failure settings instead. Liquid keys are also redacted from reviewer evidence
+  (#94, thanks @giannisCKS).
+
+### Fixed
+
+- On OpenCode V2, package script evidence starts from the shell command's
+  `workdir`, resolving relative paths against the session directory, instead of
+  always using the session directory. The `workdir` is followed to its real
+  path, as package managers do, and one that is not an existing directory marks
+  the scripts as unresolved rather than reporting another manifest. Reads stay
+  within the approved evidence roots.
+
 ### Changed
 
 - Bumped the `@opencode/client` runtime dependency to 2.1.1.

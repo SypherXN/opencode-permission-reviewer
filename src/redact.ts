@@ -61,6 +61,8 @@ const RULES: ReadonlyArray<{ re: RegExp; replace: (match: string, groups: string
   // GitLab, NVIDIA, Telegram bot tokens.
   { re: /\bglpat-[A-Za-z0-9_-]{20,}\b/g, replace: () => REDACT("gitlab") },
   { re: /\bnvapi-[A-Za-z0-9_-]{20,}\b/g, replace: () => REDACT("nvidia") },
+  // Liquid AI API keys.
+  { re: /\bliquid_[A-Za-z0-9]{32,}\b/g, replace: () => REDACT("liquid") },
   { re: /\b\d{8,12}:AA[A-Za-z0-9_-]{30,}\b/g, replace: () => REDACT("telegram") },
   // JWT (three base64url segments).
   {
