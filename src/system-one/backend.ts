@@ -61,7 +61,9 @@ export function createSystemOneInvoker(
   const apiKey = process.env[keyName]?.trim()
   if (!apiKey) throw new Error(`Missing ${keyName} for System One reviewer ${config.model}`)
   // Other providers also read LIQUID_API_KEY; never send a foreign key to Liquid AI.
-  if (providerID === "liquid-ai" && !apiKey.startsWith("liquid_")) {
+  // The full shape check also keeps a malformed key out of transport errors,
+  // which can echo the Authorization header.
+  if (providerID === "liquid-ai" && !/^liquid_[A-Za-z0-9_-]{20,}$/.test(apiKey)) {
     throw new Error(`LIQUID_API_KEY is not a Liquid AI key (expected the "liquid_" prefix)`)
   }
   const client = new TypeSafeClient({

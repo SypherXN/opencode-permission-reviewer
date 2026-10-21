@@ -163,6 +163,8 @@ describe("System One reviewer", () => {
           expect(calls[0]?.url).toBe(provider.url)
           expect(calls[0]?.init.method).toBe("POST")
           expect(new Headers(calls[0]?.init.headers).get("authorization")).toBe(`Bearer ${apiKey}`)
+          // Liquid rejects compressed request bodies.
+          expect(new Headers(calls[0]?.init.headers).get("content-encoding")).toBeNull()
           expect(JSON.parse(String(calls[0]?.init.body))).toEqual({
             model: provider.model.slice(provider.model.indexOf("/") + 1),
             state,
@@ -207,24 +209,35 @@ describe("System One reviewer", () => {
         /Missing LIQUID_API_KEY/,
       )
 
-      // Another provider's key stored under the same variable name.
-      process.env.LIQUID_API_KEY = "synthetic-foreign-router-key"
+      // Another provider's key under the same variable name, and malformed Liquid
+      // keys whose header could be echoed by a transport error.
+      const prefix = "liquid" + "_"
       const config = resolveConfig({ model: "liquid-ai/d1-ultra", escalationMode: "deny" })
-      let calls = 0
-      expect(() =>
-        createSystemOneInvoker(config, async () => {
-          calls++
-          return Response.json({ ...response(), model: "d1-ultra" })
-        }),
-      ).toThrow(/not a Liquid AI key/)
-      const result = await new SystemOneReviewerBackend(config).review(
-        envelope(),
-        new ReviewAttempt("generation", 10_000),
-      )
-      expect(calls).toBe(0)
-      expect(result.kind).toBe("deny")
-      expect(result.decisionSource).toBe("failure-safe")
-      expect(result.reason).not.toContain("synthetic-foreign-router-key")
+      for (const key of [
+        "synthetic-foreign-router-key",
+        prefix,
+        `${prefix}SHORTSYNTH`,
+        `${prefix}SYNTHETICKEY 1234567890ABCDEF`,
+        `${prefix}SYNTHETICKEY1234567890ABCDEF\nTRAILING`,
+      ]) {
+        process.env.LIQUID_API_KEY = key
+        let calls = 0
+        expect(() =>
+          createSystemOneInvoker(config, async () => {
+            calls++
+            return Response.json({ ...response(), model: "d1-ultra" })
+          }),
+        ).toThrow(/not a Liquid AI key/)
+        const result = await new SystemOneReviewerBackend(config).review(
+          envelope(),
+          new ReviewAttempt("generation", 10_000),
+        )
+        expect(calls).toBe(0)
+        expect(result.kind).toBe("deny")
+        expect(result.decisionSource).toBe("failure-safe")
+        expect(result.reason).not.toContain("SYNTHETICKEY")
+        expect(result.reason).not.toContain("synthetic-foreign-router-key")
+      }
     } finally {
       if (previous === undefined) delete process.env.LIQUID_API_KEY
       else process.env.LIQUID_API_KEY = previous

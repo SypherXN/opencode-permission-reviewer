@@ -253,11 +253,12 @@ Team, or Provider; the Go plan has no Provider API access. Use a Command Code
 API key from Studio in `CMD_API_KEY`. Jev is a headless decision model there,
 so it cannot be selected as an interactive Command Code chat model.
 
-Liquid AI's d1 decision models use the same typed System One questions and
-calibration as Jev. Create a key in the Liquid Console; its keys start with
-`liquid_`. Other providers, such as the `liquid` inference router in OpenCode's
-model catalog, also read `LIQUID_API_KEY`, so the plugin refuses to send a key
-without that prefix and the review follows the failure settings instead.
+Liquid AI's d1 decision models use the same typed System One questions and the
+same thresholds as Jev; those thresholds were calibrated on Jev. Create a key in
+the Liquid Console; its keys start with `liquid_`. Other providers, such as the
+`liquid` inference router in OpenCode's model catalog, also read
+`LIQUID_API_KEY`, so the plugin refuses to send a key that is not shaped like a
+Liquid AI key and the review follows the failure settings instead.
 
 For **Jev with selective reasoning escalation**, add a chat model already
 configured in OpenCode:
