@@ -94,6 +94,17 @@ test("public export rejects private, incomplete, and drifted runs", () => {
   systemOne.run.models[0].transport = "system-one"
   systemOne.run.models[0].format = "system_one"
   assert.throws(() => publicReport(systemOne), /private/)
+  // Liquid decision-model runs are publishable; a Jev model alongside still is not.
+  const liquid = document()
+  Object.assign(liquid.run.models[0], {
+    model: "d1",
+    endpoint: "https://api.liquid.ai/decisions",
+    transport: "system-one",
+    format: "system_one",
+  })
+  assert.equal(publicReport(liquid).models[0].model, "d1")
+  liquid.run.models.push({ ...systemOne.run.models[0], id: "jev" })
+  assert.throws(() => publicReport(liquid), /private/)
   const derived = document()
   derived.run.options.difficultSubset = { kind: "system-one-difficult" }
   assert.throws(() => publicReport(derived), /private/)

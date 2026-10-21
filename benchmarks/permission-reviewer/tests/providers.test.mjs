@@ -29,6 +29,12 @@ test("System One profile requires a Jev model and no chat-only options", () => {
   assert.equal(validateModel(systemOne).transport, "system-one")
   assert.equal(validateModel({ ...systemOne, model: "typesafe/jev" }).model, "typesafe/jev")
   assert.throws(() => validateModel({ ...systemOne, model: "other-model" }), /Jev/)
+  const liquid = { ...systemOne, model: "d1-ultra", endpoint: "https://api.liquid.ai/decisions" }
+  assert.equal(validateModel(liquid).model, "d1-ultra")
+  assert.equal(validateModel({ ...liquid, model: "d1" }).model, "d1")
+  // Liquid ids are only accepted at Liquid's own endpoint.
+  assert.throws(() => validateModel({ ...liquid, endpoint: "https://opencode.ai/zen" }), /Liquid/)
+  assert.throws(() => validateModel({ ...liquid, model: "d1-other" }), /Liquid/)
   assert.throws(() => validateModel({ ...systemOne, format: "text" }), /system_one/)
   assert.throws(() => validateModel({ ...systemOne, variant: "high" }), /reasoning variants/)
   assert.throws(() => validateModel({ ...systemOne, parameters: {} }), /parameters/)

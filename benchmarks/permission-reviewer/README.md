@@ -9,15 +9,16 @@ package and does not change plugin behavior.
 The benchmark never executes fixture commands. It has no real-conversation
 capture, log import, telemetry, or replay feature. `run` contacts only the
 configured provider endpoint, local OpenCode host, or official Command Code
-CLI. A private System One profile can call Jev with an explicitly named API-key
-environment variable. The direct provider transport does not reuse OpenCode credentials. The
+CLI. A System One profile can call Jev or Liquid d1 with an explicitly named
+API-key environment variable. The direct provider transport does not reuse OpenCode credentials. The
 optional `opencode-v1` transport delegates authentication to an official
 OpenCode V1 server; the benchmark never handles OAuth tokens. The optional
 `command-code-cli` transport uses the CLI's existing login, not its separately
 billed Provider API. See the [evaluation protocol](./docs/METHODOLOGY.md)
 before using a subscription and the [results table](./RESULTS.md) for published
 evaluations. Local model results are kept in a [separate table](./RESULTS_LOCAL.md).
-System One runs are private and the harness refuses to export them.
+Jev System One runs are private and the harness refuses to export them; Liquid
+d1 runs can be exported like any other synthetic run.
 
 ## Validate without model calls
 
@@ -93,8 +94,12 @@ profile](./examples/models.system-one.example.json) or the [Command Code Provide
 API profile](./examples/models.system-one-commandcode.example.json),
 export its named key, set `--concurrency 2 --format-retries 0`, and start with a
 one-case transport check. The typed response is reconciled by the same plugin
-code used at runtime. Raw prompts, answers, and scores stay local: System One
-runs are rejected by `export-public` even when the corpus is synthetic.
+code used at runtime. Raw prompts, answers, and scores stay local: Jev runs are
+rejected by `export-public` even when the corpus is synthetic.
+
+For Liquid d1 or d1-ultra, use the [Liquid profile](./examples/models.system-one-liquid.example.json)
+with `LIQUID_API_KEY` and the same settings. The model ID is accepted only with
+Liquid's own endpoint, and its complete runs can be exported for publication.
 
 After the complete Jev run, evaluate a reasoning model only on Jev's valid
 difficult decisions with the recorded subset selector:

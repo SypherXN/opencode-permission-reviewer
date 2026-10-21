@@ -1,3 +1,4 @@
+import { isLiquidSystemOne } from "./providers.mjs"
 import { assert } from "./util.mjs"
 
 const syntheticOrigins = new Set(["authored-synthetic", "metamorphic-context"])
@@ -31,9 +32,11 @@ export function publicReport(document) {
   const { run, summary, results } = document
   assert(
     !(run?.models ?? []).some(
-      (model) => model.transport === "system-one" || model.format === "system_one",
+      (model) =>
+        (model.transport === "system-one" || model.format === "system_one") &&
+        !isLiquidSystemOne(model),
     ),
-    "System One evaluation runs are private and cannot be exported by this harness.",
+    "Jev System One evaluation runs are private and cannot be exported by this harness.",
   )
   assert(
     run?.options?.difficultSubset === undefined,

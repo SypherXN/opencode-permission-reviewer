@@ -1,0 +1,12 @@
+{
+  "models": [
+    {
+      "id": "liquid-d1-ultra",
+      "model": "d1-ultra",
+      "endpoint": "https://api.liquid.ai/decisions",
+      "apiKeyEnv": "LIQUID_API_KEY",
+      "transport": "system-one",
+      "format": "system_one"
+    }
+  ]
+}

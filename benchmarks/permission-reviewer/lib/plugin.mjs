@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process"
 import { resolve, join } from "node:path"
 import { pathToFileURL } from "node:url"
 import { createHash } from "node:crypto"
+import { isLiquidSystemOne } from "./providers.mjs"
 import { assert, sha256 } from "./util.mjs"
 
 // Git blob hashes of the security-critical files actually inspected for this kit.
@@ -129,7 +130,9 @@ export async function openPlugin(repo, { allowDrift = false, allowNode = false }
       model:
         model?.transport === "system-one" && model.model === "typesafe/jev"
           ? "commandcode/typesafe/jev"
-          : (model?.model ?? base.model),
+          : isLiquidSystemOne(model)
+            ? `liquid-ai/${model.model}`
+            : (model?.model ?? base.model),
       variant: model?.variant ?? base.variant,
       outputFormat: model?.format === "text" ? "text" : "json_schema",
       audit: false,

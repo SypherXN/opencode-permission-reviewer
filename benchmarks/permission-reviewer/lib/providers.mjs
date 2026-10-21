@@ -12,6 +12,17 @@ const RESERVED = new Set([
   "authorization",
 ])
 const FORMATS = new Set(["text", "json_schema", "tool", "system_one"])
+const LIQUID_ENDPOINT = "https://api.liquid.ai/decisions"
+
+/** Liquid AI decision models. Unlike Jev, their System One results may be published. */
+export function isLiquidSystemOne(model) {
+  return (
+    model?.transport === "system-one" &&
+    ["d1", "d1-ultra"].includes(model.model) &&
+    model.endpoint === LIQUID_ENDPOINT
+  )
+}
+
 export function validateModel(model) {
   assert(
     model && typeof model.id === "string" && /^[a-zA-Z0-9_.-]+$/.test(model.id),
@@ -61,8 +72,8 @@ export function validateModel(model) {
   if (transport === "system-one") {
     assert(url.protocol === "https:", "System One endpoint must use HTTPS.")
     assert(
-      /^jev(?:-|$)/.test(model.model) || model.model === "typesafe/jev",
-      "System One transport requires a Jev model ID.",
+      /^jev(?:-|$)/.test(model.model) || model.model === "typesafe/jev" || isLiquidSystemOne(model),
+      `System One transport requires a Jev model ID or a Liquid d1 model at ${LIQUID_ENDPOINT}.`,
     )
     assert(model.format === "system_one", "System One transport requires system_one format.")
     assert(model.apiKeyEnv !== undefined, "System One transport requires apiKeyEnv.")
