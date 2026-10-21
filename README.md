@@ -230,12 +230,13 @@ starting OpenCode. The Jev call uses the provider's System One endpoint directly
 OpenCode's `/connect` credentials and the Command Code CLI login are not read by
 this call. The supported routes are:
 
-| Reviewer `model`                                       | Required environment variable | System One API                                                                                |
-| ------------------------------------------------------ | ----------------------------- | --------------------------------------------------------------------------------------------- |
-| `opencode/jev-1.13` (or `opencode/jev-1.13-free`)      | `OPENCODE_API_KEY`            | [OpenCode Zen](https://opencode.ai/docs/en/zen/#jev)                                          |
-| `typesafe-ai/jev-1.13.0` (or `typesafe-ai/jev-latest`) | `TYPESAFE_API_KEY`            | [TypeSafe AI](https://docs.typesafe.ai/sdk/javascript)                                        |
-| `commandcode/typesafe/jev`                             | `CMD_API_KEY`                 | [Command Code Provider API](https://commandcode.ai/docs/provider#decision-models-typesafejev) |
-| `liquid-ai/d1` (or `liquid-ai/d1-ultra`)               | `LIQUID_API_KEY`              | [Liquid AI](https://docs.liquid.ai/lfm/models/d1)                                             |
+| Reviewer `model`                                                                                               | Required environment variable | System One API                                                                                |
+| -------------------------------------------------------------------------------------------------------------- | ----------------------------- | --------------------------------------------------------------------------------------------- |
+| `opencode/jev-1.13` (or `opencode/jev-1.13-free`)                                                              | `OPENCODE_API_KEY`            | [OpenCode Zen](https://opencode.ai/docs/en/zen/#jev)                                          |
+| `typesafe-ai/jev-1.13.0` (or `typesafe-ai/jev-latest`)                                                         | `TYPESAFE_API_KEY`            | [TypeSafe AI](https://docs.typesafe.ai/sdk/javascript)                                        |
+| `commandcode/typesafe/jev`                                                                                     | `CMD_API_KEY`                 | [Command Code Provider API](https://commandcode.ai/docs/provider#decision-models-typesafejev) |
+| `liquid-ai/d1` (or `liquid-ai/d1-ultra`)                                                                       | `LIQUID_API_KEY`              | [Liquid AI](https://docs.liquid.ai/lfm/models/d1)                                             |
+| `baseten/decision-models/baseten-mammoth-27b-latest` (or `baseten/decision-models/baseten-elephant-9b-latest`) | `BASETEN_API_KEY`             | [Baseten](https://docs.baseten.co/inference/model-apis/decision-models)                       |
 
 For **Jev only**, omit `escalationReviewer`:
 

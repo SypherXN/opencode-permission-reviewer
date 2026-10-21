@@ -14,7 +14,22 @@ const RESERVED = new Set([
 const FORMATS = new Set(["text", "json_schema", "tool", "system_one"])
 const LIQUID_ENDPOINT = "https://api.liquid.ai/decisions"
 
-/** Liquid AI decision models. Unlike Jev, their System One results may be published. */
+const BASETEN_ENDPOINT = "https://inference.baseten.co"
+const BASETEN_MODELS = [
+  "decision-models/baseten-elephant-9b-latest",
+  "decision-models/baseten-mammoth-27b-latest",
+]
+
+/** Baseten decision models, accepted only at Baseten's own endpoint. */
+export function isBasetenSystemOne(model) {
+  return (
+    model?.transport === "system-one" &&
+    BASETEN_MODELS.includes(model.model) &&
+    model.endpoint === BASETEN_ENDPOINT
+  )
+}
+
+/** Liquid AI decision models, accepted only at Liquid's own endpoint. */
 export function isLiquidSystemOne(model) {
   return (
     model?.transport === "system-one" &&
@@ -72,8 +87,11 @@ export function validateModel(model) {
   if (transport === "system-one") {
     assert(url.protocol === "https:", "System One endpoint must use HTTPS.")
     assert(
-      /^jev(?:-|$)/.test(model.model) || model.model === "typesafe/jev" || isLiquidSystemOne(model),
-      `System One transport requires a Jev model ID or a Liquid d1 model at ${LIQUID_ENDPOINT}.`,
+      /^jev(?:-|$)/.test(model.model) ||
+        model.model === "typesafe/jev" ||
+        isLiquidSystemOne(model) ||
+        isBasetenSystemOne(model),
+      `System One transport requires a Jev model ID, a Liquid d1 model at ${LIQUID_ENDPOINT}, or a Baseten decision model at ${BASETEN_ENDPOINT}.`,
     )
     assert(model.format === "system_one", "System One transport requires system_one format.")
     assert(model.apiKeyEnv !== undefined, "System One transport requires apiKeyEnv.")

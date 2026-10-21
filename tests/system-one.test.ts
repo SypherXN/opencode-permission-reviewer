@@ -100,6 +100,15 @@ describe("System One reviewer", () => {
     expect(isSystemOneReviewerModel("liquid-ai/d1-ultra")).toBe(true)
     expect(isSystemOneReviewerModel("liquid-ai/d1-other")).toBe(false)
     expect(isSystemOneReviewerModel("liquid/d1")).toBe(false)
+    expect(isSystemOneReviewerModel("baseten/decision-models/baseten-elephant-9b-latest")).toBe(
+      true,
+    )
+    expect(isSystemOneReviewerModel("baseten/decision-models/baseten-mammoth-27b-latest")).toBe(
+      true,
+    )
+    expect(isSystemOneReviewerModel("baseten/decision-models/other")).toBe(false)
+    expect(isSystemOneReviewerModel("baseten/qwen3.5-27b")).toBe(false)
+    expect(isSystemOneReviewerModel("other/decision-models/baseten-elephant-9b-latest")).toBe(false)
     expect(isSystemOneReviewerModel("other/d1-ultra")).toBe(false)
     expect(isSystemOneReviewerModel("commandcode/jev-1.13")).toBe(false)
     expect(isSystemOneReviewerModel("commandcode/typesafe/other")).toBe(false)
@@ -107,7 +116,7 @@ describe("System One reviewer", () => {
     expect(isSystemOneReviewerModel("opencode/not-jev")).toBe(false)
   })
 
-  test("routes Zen, TypeSafe, Command Code, and Liquid through their System One endpoints", async () => {
+  test("routes Zen, TypeSafe, Command Code, Liquid, and Baseten through their System One endpoints", async () => {
     const providers = [
       {
         model: "opencode/jev-1.13",
@@ -138,6 +147,18 @@ describe("System One reviewer", () => {
         returnedModel: "d1-ultra",
         keyName: "LIQUID_API_KEY",
         url: "https://api.liquid.ai/decisions/v1/systemone",
+      },
+      {
+        model: "baseten/decision-models/baseten-elephant-9b-latest",
+        returnedModel: "decision-models/baseten-elephant-9b-latest",
+        keyName: "BASETEN_API_KEY",
+        url: "https://inference.baseten.co/v1/systemone",
+      },
+      {
+        model: "baseten/decision-models/baseten-mammoth-27b-latest",
+        returnedModel: "decision-models/baseten-mammoth-27b-latest",
+        keyName: "BASETEN_API_KEY",
+        url: "https://inference.baseten.co/v1/systemone",
       },
     ] as const
     const previousBaseURL = process.env.TYPESAFE_BASE_URL
@@ -200,6 +221,20 @@ describe("System One reviewer", () => {
     expect(
       parseSystemOneReview(valid, resolveConfig({ model: "typesafe-ai/jev-latest" })),
     ).toBeUndefined()
+  })
+
+  test("rejects a returned model other than the configured Baseten model", () => {
+    const model = "decision-models/baseten-elephant-9b-latest"
+    const config = resolveConfig({ model: `baseten/${model}` })
+    const valid = { ...response(), model }
+    expect(parseSystemOneReview(valid, config)?.decision.outcome).toBe("allow")
+    for (const other of [
+      "decision-models/baseten-mammoth-27b-latest",
+      "jev-1.13",
+      `baseten/${model}`,
+    ]) {
+      expect(parseSystemOneReview({ ...valid, model: other }, config)).toBeUndefined()
+    }
   })
 
   test("never sends a non-Liquid key to Liquid AI", async () => {

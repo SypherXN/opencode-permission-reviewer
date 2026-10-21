@@ -57,7 +57,9 @@ export function createSystemOneInvoker(
         ? "CMD_API_KEY"
         : providerID === "liquid-ai"
           ? "LIQUID_API_KEY"
-          : "TYPESAFE_API_KEY"
+          : providerID === "baseten"
+            ? "BASETEN_API_KEY"
+            : "TYPESAFE_API_KEY"
   const apiKey = process.env[keyName]?.trim()
   if (!apiKey) throw new Error(`Missing ${keyName} for System One reviewer ${config.model}`)
   // Other providers also read LIQUID_API_KEY; never send a foreign key to Liquid AI.
@@ -74,7 +76,9 @@ export function createSystemOneInvoker(
         ? { baseURL: "https://api.commandcode.ai/provider" }
         : providerID === "liquid-ai"
           ? { baseURL: "https://api.liquid.ai/decisions" }
-          : {}),
+          : providerID === "baseten"
+            ? { baseURL: "https://inference.baseten.co" }
+            : {}),
     defaultModel: modelID,
     logLevel: "off",
     timeout: config.timeoutMs,

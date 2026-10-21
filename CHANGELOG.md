@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure settings instead. Liquid keys are also redacted from reviewer evidence
   (#94, thanks @giannisCKS). On the synthetic benchmark, `liquid-ai/d1-ultra` is
   recommended and `liquid-ai/d1` is not; see the README for its settings.
+- Baseten's mammoth-1 and elephant-1 decision models as System One reviewer
+  models (`baseten/decision-models/baseten-mammoth-27b-latest` and
+  `baseten/decision-models/baseten-elephant-9b-latest`), with the key read from
+  `BASETEN_API_KEY`.
 
 ### Fixed
 

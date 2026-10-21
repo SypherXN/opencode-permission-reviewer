@@ -35,6 +35,15 @@ test("System One profile requires a Jev model and no chat-only options", () => {
   // Liquid ids are only accepted at Liquid's own endpoint.
   assert.throws(() => validateModel({ ...liquid, endpoint: "https://opencode.ai/zen" }), /Liquid/)
   assert.throws(() => validateModel({ ...liquid, model: "d1-other" }), /Liquid/)
+  const baseten = {
+    ...systemOne,
+    model: "decision-models/baseten-mammoth-27b-latest",
+    endpoint: "https://inference.baseten.co",
+  }
+  assert.equal(validateModel(baseten).model, baseten.model)
+  // Baseten ids are only accepted at Baseten's own endpoint.
+  assert.throws(() => validateModel({ ...baseten, endpoint: "https://opencode.ai/zen" }), /Baseten/)
+  assert.throws(() => validateModel({ ...baseten, model: "decision-models/other" }), /Baseten/)
   assert.throws(() => validateModel({ ...systemOne, format: "text" }), /system_one/)
   assert.throws(() => validateModel({ ...systemOne, variant: "high" }), /reasoning variants/)
   assert.throws(() => validateModel({ ...systemOne, parameters: {} }), /parameters/)

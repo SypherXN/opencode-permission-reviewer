@@ -3,14 +3,14 @@ import { execFileSync } from "node:child_process"
 import { resolve, join } from "node:path"
 import { pathToFileURL } from "node:url"
 import { createHash } from "node:crypto"
-import { isLiquidSystemOne } from "./providers.mjs"
+import { isBasetenSystemOne, isLiquidSystemOne } from "./providers.mjs"
 import { assert, sha256 } from "./util.mjs"
 
 // Git blob hashes of the security-critical files actually inspected for this kit.
 export const PINNED_BLOBS = {
   "src/policy.ts": "72dc68cc8de6f536b196e3ffbe840f8b2236cd01",
   "src/context.ts": "5473abbe19ccce27163ceaaf87a63e63e6d5215a",
-  "src/config.ts": "dc467e66ede791c12f846f9d3ba83ea68c866af5",
+  "src/config.ts": "526a96f1d6211db8eac98ebb983fe4294f1c649b",
   "src/decision.ts": "ad3443f3bf2ca1b34b3b23e8115c79148e19238b",
   "src/policy/policy-engine.ts": "b4470dc188d956cc0ed25454c2d34465110fe1be",
   "src/escalation.ts": "947f5ed665600927e21be343995cdc4993a45f5a",
@@ -21,7 +21,7 @@ export const PINNED_BLOBS = {
   "src/capability/bash-analyzer.ts": "dcf60b95b18ffe3a0256a01075bd34634265bfec",
   "src/shell-lexer.ts": "eaf40e0f9a66f82e61ff4c38532c103c37f82759",
   "src/capability/heredoc-extractor.ts": "de3c1bb00f5d7e430c86845455ce6de6b1c94f6c",
-  "src/system-one/review.ts": "aa29c8cb7ea1d785d5c70fea76bdf668aed04dc4",
+  "src/system-one/review.ts": "af86e3e95bcb19d7ef892612982ce8515a07f52a",
 }
 const gitBlob = (bytes) =>
   createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex")
@@ -132,7 +132,9 @@ export async function openPlugin(repo, { allowDrift = false, allowNode = false }
           ? "commandcode/typesafe/jev"
           : isLiquidSystemOne(model)
             ? `liquid-ai/${model.model}`
-            : (model?.model ?? base.model),
+            : isBasetenSystemOne(model)
+              ? `baseten/${model.model}`
+              : (model?.model ?? base.model),
       variant: model?.variant ?? base.variant,
       outputFormat: model?.format === "text" ? "text" : "json_schema",
       audit: false,
