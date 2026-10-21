@@ -247,3 +247,49 @@ Meta models. This benchmark uses only synthetic data. For day-to-day use, this
 is a strong option for public repositories and other non-sensitive work. It is
 not recommended for confidential source code or private data. See the official
 [OpenCode Go privacy table](https://opencode.ai/docs/go/).
+
+## Liquid d1 and d1-ultra (System One)
+
+Evaluated on 2026-10-21 against plugin source `f533aec` through Liquid AI's
+System One API directly, not through an OpenCode host. Both runs returned 600
+valid typed decisions with no transport failures or retries, and reported the
+same 3.04 million input tokens. The typed answers are reconciled by the plugin's
+own System One code, so `Core/100` below is the effective result after the
+plugin's confidence, consistency, and core gates.
+
+| Model    | Profile                             | Core/100 | Luna calls | Dangerous | Unsupported | Critical | False denials | Unnecessary escalations | Benign auto-approval |
+| -------- | ----------------------------------- | -------: | ---------: | --------: | ----------: | -------: | ------------: | ----------------------: | -------------------: |
+| d1-ultra | alone, confidence 0.4               |    95.32 |          0 |         0 |           0 |        0 |             0 |                      16 |                92.5% |
+| d1-ultra | + GPT-6 Luna medium, reasoning 0.6  |    96.40 |    11 (2%) |         0 |           0 |        0 |             1 |                       6 |                96.7% |
+| d1-ultra | + GPT-6 Luna medium, reasoning 0.38 |    96.33 |    49 (8%) |         0 |           2 |        0 |             1 |                       2 |                98.6% |
+| d1       | alone, confidence 0.4               |    89.60 |          0 |         0 |           6 |        0 |             6 |                      22 |                86.9% |
+| d1       | + GPT-6 Luna medium, reasoning 0.38 |    90.72 |    35 (6%) |         0 |           7 |        0 |             6 |                      10 |                92.5% |
+
+d1-ultra alone made no dangerous, unsupported, or critical approvals and no
+false denials. Its 95% family-bootstrap interval is 93.37-96.91 for the
+effective score and 94.91-98.03 for the model decision (96.57). Mean API
+latency was 0.38 s (p95 0.54 s). d1 scored 89.60 (87.32-91.71), with six
+unsupported approvals, five of them Git cases decided with confidence between
+0.52 and 0.96, and six false denials. Mean latency was 0.37 s.
+
+Thresholds were swept offline from the stored responses with zero additional
+calls: `systemOneConfidenceThreshold` from 0.3 to 0.7 and
+`systemOneReasoningThreshold` from 0.2 to 1. Profiles were selected on the dev
+and validation splits among those with no dangerous, unsupported, or critical
+approvals on the full corpus, then checked on the 138-case holdout. For d1-ultra
+alone, every threshold from 0.3 to 0.4 gives the same result and higher values
+only add escalations, so the default 0.4 is kept. With a reasoning reviewer,
+0.6 scored 96.60 on the selection splits and 95.68 on holdout. The default 0.38
+sends four times as many cases to Luna and lets two of Luna's own unsupported
+approvals through. No d1 threshold removed its unsupported approvals: raising
+the confidence threshold to 0.7 still left four while adding 15 escalations.
+
+The reasoning-reviewer rows replay the published GPT-6 Luna medium decisions
+for the same cases (plugin source `dc5fd3d`), re-gated by the current core,
+instead of calling Luna again. A routed Luna `allow` without sufficient evidence
+stays an escalation, as at runtime. These rows estimate the routing policy; they
+are not a live two-model run.
+
+d1-ultra is recommended as a System One reviewer, alone or with a reasoning
+reviewer and `systemOneReasoningThreshold: 0.6`. d1 is not recommended for
+permission review on this corpus.

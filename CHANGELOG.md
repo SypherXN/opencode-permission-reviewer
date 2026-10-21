@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   models, with the key read from `LIQUID_API_KEY`. A key that is not shaped
   like a Liquid AI key (`liquid_` prefix) is never sent; the review follows the
   failure settings instead. Liquid keys are also redacted from reviewer evidence
-  (#94, thanks @giannisCKS).
+  (#94, thanks @giannisCKS). On the synthetic benchmark, `liquid-ai/d1-ultra` is
+  recommended and `liquid-ai/d1` is not; see the README for its settings.
 
 ### Fixed
 

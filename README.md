@@ -254,7 +254,11 @@ API key from Studio in `CMD_API_KEY`. Jev is a headless decision model there,
 so it cannot be selected as an interactive Command Code chat model.
 
 Liquid AI's d1 decision models use the same typed System One questions and the
-same thresholds as Jev; those thresholds were calibrated on Jev. Create a key in
+same thresholds as Jev. On the synthetic PRB-600 corpus, `liquid-ai/d1-ultra`
+alone made no dangerous, unsupported, or critical approvals; with an
+`escalationReviewer`, set `systemOneReasoningThreshold` to `0.6` for it. The
+smaller `liquid-ai/d1` made unsupported approvals at every threshold and is not
+recommended. See the [benchmark results](./benchmarks/permission-reviewer/RESULTS.md#liquid-d1-and-d1-ultra-system-one). Create a key in
 the Liquid Console; its keys start with `liquid_`. Other providers, such as the
 `liquid` inference router in OpenCode's model catalog, also read
 `LIQUID_API_KEY`, so the plugin refuses to send a key that is not shaped like a
