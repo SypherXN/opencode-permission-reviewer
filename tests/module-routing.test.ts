@@ -852,4 +852,96 @@ describe("Quartermaster module consumer", () => {
     const timedOut = await hung.select(new AbortController().signal)
     expect(timedOut).toMatchObject({ status: "unavailable", reasonCode: "timeout" })
   })
+
+  test("falls back to the configured reviewer model when Quartermaster cannot answer", async () => {
+    let invoked = 0
+    const backend = new SystemOneReviewerBackend(
+      route(true),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        async select() {
+          return { status: "unavailable", reasonCode: "service-unavailable" }
+        },
+        async reportRateLimit() {
+          throw new Error("unused")
+        },
+      },
+      () => async () => {
+        invoked++
+        return response("jev-1.13-free")
+      },
+    )
+    const result = await backend.review(envelope(), new ReviewAttempt("generation", 10_000))
+    expect(result.kind).toBe("allow")
+    expect(result.decisionSource).toBe("system-one-reviewer")
+    expect(result.reviewerModel).toBe("opencode/jev-1.13-free")
+    expect(invoked).toBe(1)
+  })
+
+  test("still fails closed when Quartermaster answers with a decision", async () => {
+    const backend = new SystemOneReviewerBackend(
+      route(true),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        async select() {
+          return {
+            apiVersion: 1,
+            module: OPR_JEV_MODULE,
+            evaluatedAt: EVALUATED_AT,
+            status: "no-eligible",
+            candidates: [
+              {
+                ...FREE,
+                quota: "unknown",
+                health: "unknown",
+                reason: "cooldown",
+                blockedUntil: EVALUATED_AT + 60_000,
+                remainingMs: 60_000,
+              },
+            ],
+            nextEligibleAt: EVALUATED_AT + 60_000,
+          }
+        },
+        async reportRateLimit() {
+          throw new Error("unused")
+        },
+      },
+      () => async () => {
+        throw new Error("the reviewer must not be called")
+      },
+    )
+    const result = await backend.review(envelope(), new ReviewAttempt("generation", 10_000))
+    expect(result.decisionSource).toBe("failure-safe")
+    expect(result.reason).toContain("no eligible opr-jev model")
+  })
+
+  test("still fails closed when Quartermaster answers with a broken document", async () => {
+    const backend = new SystemOneReviewerBackend(
+      route(true),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        async select() {
+          return { status: "selected", module: OPR_JEV_MODULE }
+        },
+        async reportRateLimit() {
+          throw new Error("unused")
+        },
+      },
+      () => async () => {
+        throw new Error("the reviewer must not be called")
+      },
+    )
+    const result = await backend.review(envelope(), new ReviewAttempt("generation", 10_000))
+    expect(result.decisionSource).toBe("failure-safe")
+    expect(result.reason).toContain("module selection is unavailable (invalid-response)")
+  })
 })

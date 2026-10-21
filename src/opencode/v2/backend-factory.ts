@@ -38,8 +38,12 @@ export function createV2ReviewerBackend(context: Context, config: ReviewerConfig
   if (!isSystemOneReviewerModel(config.model)) return new V2ReviewerBackend(context, config)
   const secondaryConfig = escalationConfig(config)
   const secondary = secondaryConfig ? new V2ReviewerBackend(context, secondaryConfig) : undefined
+  const logger = config.debug
+    ? (message: string, details?: unknown) =>
+        console.error(`[opencode-permission-reviewer] ${message}`, details ?? "")
+    : undefined
   const modules = config.moduleRouting
-    ? createQuartermasterModuleClient(context as unknown as QuartermasterRpcHost)
+    ? createQuartermasterModuleClient(context as unknown as QuartermasterRpcHost, undefined, logger)
     : undefined
   const primary = new SystemOneReviewerBackend(
     config,
@@ -48,6 +52,8 @@ export function createV2ReviewerBackend(context: Context, config: ReviewerConfig
     undefined,
     undefined,
     modules,
+    undefined,
+    logger,
   )
   return {
     owns: (sessionID) => secondary?.owns(sessionID) ?? false,

@@ -1,5 +1,5 @@
 import type { ModuleRoutingConfig } from "../types.ts"
-import { isFreeSystemOneModel, isSystemOneReviewerModel } from "../config.ts"
+import { isFreeSystemOneModel, isSystemOneReviewerModel, splitModel } from "../config.ts"
 
 /** Quartermaster module OPR asks for. Labels are not authenticated identities. */
 export const OPR_JEV_MODULE = "opr-jev"
@@ -16,6 +16,9 @@ const UNAVAILABLE = [
 ] as const
 
 export type ModuleUnavailableReason = (typeof UNAVAILABLE)[number]
+
+/** Debug sink for the module exchange; the audit trail keeps the reason code. */
+export type ModuleLogger = (message: string, details?: unknown) => void
 
 export interface ModuleModelRef {
   providerID: string
@@ -297,34 +300,15 @@ export function isStructuredRateLimit(error: unknown): boolean {
   return false
 }
 
-export function permitSelectedModel(
+export type ModelPermitResult =
+  { ok: true; providerID: string; modelID: string; model: string } | { ok: false; reason: string }
+
+/** Policy that any model must pass before the System One transport may call it. */
+export function permitModel(
   routing: ModuleRoutingConfig,
-  selection: ModuleSelectionResult,
+  selected: ModuleModelRef,
   blocked?: { providerID: string; modelID: string },
-):
-  { ok: true; providerID: string; modelID: string; model: string } | { ok: false; reason: string } {
-  if (selection.status === "unavailable") {
-    return {
-      ok: false,
-      reason:
-        "Quartermaster module selection is unavailable, so the direct Jev transport was not called.",
-    }
-  }
-  if (selection.status === "no-module") {
-    return {
-      ok: false,
-      reason:
-        "Quartermaster has no opr-jev module profile, so the direct Jev transport was not called.",
-    }
-  }
-  if (selection.status === "no-eligible") {
-    return {
-      ok: false,
-      reason:
-        "Quartermaster has no eligible opr-jev model, so the direct Jev transport was not called.",
-    }
-  }
-  const selected = selection.selected
+): ModelPermitResult {
   if (selected.variant !== undefined || !isSystemOneReviewerModel(systemOneModelName(selected))) {
     return {
       ok: false,
@@ -362,10 +346,63 @@ export function permitSelectedModel(
   }
 }
 
+export function permitSelectedModel(
+  routing: ModuleRoutingConfig,
+  selection: ModuleSelectionResult,
+  blocked?: { providerID: string; modelID: string },
+): ModelPermitResult {
+  if (selection.status === "unavailable") {
+    return {
+      ok: false,
+      reason: `Quartermaster module selection is unavailable (${selection.reasonCode}), so the direct Jev transport was not called.`,
+    }
+  }
+  if (selection.status === "no-module") {
+    return {
+      ok: false,
+      reason:
+        "Quartermaster has no opr-jev module profile, so the direct Jev transport was not called.",
+    }
+  }
+  if (selection.status === "no-eligible") {
+    return {
+      ok: false,
+      reason:
+        "Quartermaster has no eligible opr-jev model, so the direct Jev transport was not called.",
+    }
+  }
+  return permitModel(routing, selection.selected, blocked)
+}
+
+/**
+ * Quartermaster gave no decision at all (transport failure or timeout), so there is
+ * no Quartermaster decision to honour. The trusted configured reviewer model may be
+ * used instead, under the same allowlist and paid-use policy.
+ */
+export function permitFallbackModel(
+  routing: ModuleRoutingConfig,
+  selection: ModuleSelectionResult,
+  configuredModel: string,
+  blocked?: { providerID: string; modelID: string },
+): ModelPermitResult {
+  if (selection.status !== "unavailable") return { ok: false, reason: "Quartermaster answered" }
+  if (selection.reasonCode !== "service-unavailable" && selection.reasonCode !== "timeout") {
+    return { ok: false, reason: "Quartermaster did not fail to answer" }
+  }
+  let configured: ModuleModelRef
+  try {
+    configured = splitModel(configuredModel)
+  } catch {
+    return { ok: false, reason: "The configured reviewer model is not a valid model reference" }
+  }
+  return permitModel(routing, configured, blocked)
+}
+
 async function callModuleMethod(
   invoke: (signal: AbortSignal) => Promise<unknown>,
   timeoutMs: number,
   signal: AbortSignal,
+  logger?: ModuleLogger,
 ): Promise<unknown> {
   if (signal.aborted) return { status: "unavailable", reasonCode: "cancelled" }
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647) {
@@ -385,10 +422,12 @@ async function callModuleMethod(
     if (signal.aborted) return { status: "unavailable", reasonCode: "cancelled" }
     if (controller.signal.aborted) return { status: "unavailable", reasonCode }
     return result
-  } catch {
+  } catch (error) {
+    const code = signal.aborted ? "cancelled" : reasonCode
+    logger?.("Quartermaster module RPC failed", { reasonCode: code, error: String(error) })
     return {
       status: "unavailable",
-      reasonCode: signal.aborted ? "cancelled" : reasonCode,
+      reasonCode: code,
     }
   } finally {
     clearTimeout(timer)
@@ -399,6 +438,7 @@ async function callModuleMethod(
 export function createQuartermasterModuleClient(
   ctx: QuartermasterRpcHost,
   timeoutMs = MODULE_RPC_TIMEOUT_MS,
+  logger?: ModuleLogger,
 ): ModuleRoutingClient {
   return {
     async select(signal) {
@@ -409,8 +449,14 @@ export function createQuartermasterModuleClient(
             .selectModule({ module: OPR_JEV_MODULE }, { signal: rpcSignal }),
         timeoutMs,
         signal,
+        logger,
       )
-      return interpretModuleSelection(result)
+      const interpreted = interpretModuleSelection(result)
+      logger?.("Quartermaster module selection", {
+        raw: result,
+        outcome: interpreted.status === "unavailable" ? interpreted.reasonCode : interpreted.status,
+      })
+      return interpreted
     },
     async reportRateLimit(model, signal) {
       const expected = {
@@ -425,8 +471,14 @@ export function createQuartermasterModuleClient(
             .reportModuleCooldown({ ...expected, reason: "rate-limit" }, { signal: rpcSignal }),
         timeoutMs,
         signal,
+        logger,
       )
-      return interpretCooldownReport(result, expected)
+      const interpreted = interpretCooldownReport(result, expected)
+      logger?.("Quartermaster module cooldown report", {
+        raw: result,
+        outcome: "status" in interpreted ? interpreted.reasonCode : interpreted.accepted,
+      })
+      return interpreted
     },
   }
 }

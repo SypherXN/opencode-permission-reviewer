@@ -12,7 +12,9 @@ import {
   interpretCooldownReport,
   interpretModuleSelection,
   isStructuredRateLimit,
+  permitFallbackModel,
   permitSelectedModel,
+  type ModuleLogger,
   type ModuleRoutingClient,
 } from "./module-routing.ts"
 import {
@@ -105,6 +107,7 @@ export class SystemOneReviewerBackend {
     private readonly recordReviewerMs?: (envelope: ReviewEnvelope, ms: number) => void,
     private readonly modules?: ModuleRoutingClient,
     createInvoke?: (config: ReviewerConfig) => SystemOneInvoke,
+    private readonly logger?: ModuleLogger,
   ) {
     this.createInvoke = createInvoke ?? createSystemOneInvoker
   }
@@ -216,7 +219,24 @@ export class SystemOneReviewerBackend {
       const selection = interpretModuleSelection(
         await attempt.wait(this.modules.select(attempt.signal)),
       )
-      const chosen = permitSelectedModel(routing, selection, blocked)
+      const selected = permitSelectedModel(routing, selection, blocked)
+      // Quartermaster could not be reached (it threw or timed out) means no
+      // decision came back at all, not a refusal. Fall back to the trusted
+      // configured reviewer model, under the same allowlist and paid-use
+      // policy, instead of failing the review closed. An explicit Quartermaster
+      // decision (no module, no eligible model) and a broken contract still
+      // fail closed.
+      let chosen = selected
+      if (!selected.ok) {
+        const fallback = permitFallbackModel(routing, selection, this.config.model, blocked)
+        if (fallback.ok) {
+          this.logger?.(
+            "Quartermaster module selection gave no decision; using the configured reviewer model",
+            { reason: selected.reason, model: fallback.model },
+          )
+          chosen = fallback
+        }
+      }
       if (!chosen.ok) return this.failClosed(chosen.reason)
       useModel(chosen.model)
       const selectedConfig = { ...this.config, model: chosen.model }
