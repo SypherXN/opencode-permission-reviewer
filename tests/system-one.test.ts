@@ -145,7 +145,10 @@ describe("System One reviewer", () => {
     try {
       for (const provider of providers) {
         const previousKey = process.env[provider.keyName]
-        const apiKey = `${provider.keyName === "LIQUID_API_KEY" ? "liquid" + "_" : ""}synthetic-${provider.keyName.toLowerCase()}`
+        const apiKey =
+          provider.keyName === "LIQUID_API_KEY"
+            ? "liquid" + "_SyntheticLiquidRoutingKey1234567890"
+            : `synthetic-${provider.keyName.toLowerCase()}`
         process.env[provider.keyName] = apiKey
         try {
           const config = resolveConfig({ model: provider.model })
@@ -217,8 +220,9 @@ describe("System One reviewer", () => {
         "synthetic-foreign-router-key",
         prefix,
         `${prefix}SHORTSYNTH`,
-        `${prefix}SYNTHETICKEY 1234567890ABCDEF`,
-        `${prefix}SYNTHETICKEY1234567890ABCDEF\nTRAILING`,
+        `${prefix}SYNTHETICKEY 1234567890ABCDEFGHIJKLMNOP`,
+        `${prefix}SYNTHETICKEY_1234567890-ABCDEFGHIJKLMNOP`,
+        `${prefix}SYNTHETICKEY1234567890ABCDEFGHIJKLMN\nTRAILING`,
       ]) {
         process.env.LIQUID_API_KEY = key
         let calls = 0

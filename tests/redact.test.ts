@@ -22,7 +22,7 @@ const SLACK = "xox" + "b-synthetic-slack-token-1234567890"
 const JWT = "ey" + "JhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.signatureabcdefg"
 const GLPAT = "gl" + "pat-syntheticgitlabtoken1234"
 const NVAPI = "nv" + "api-syntheticnvidiatoken1234abcd"
-const LIQUID = "liq" + "uid_syntheticliquidtoken1234abcd"
+const LIQUID = "liq" + "uid_SyntheticLiquidToken1234567890abcdef"
 const AWS_SECRET_VAL = "wJalrXUt" + "nFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 const AWS_SECRET_LINE = "AWS_SECRET_ACCESS_KEY=" + AWS_SECRET_VAL
 const TELEGRAM = "123456789:" + "AAH-synthetic-telegram-bot-token-12345"
@@ -209,7 +209,13 @@ describe("redactSecrets — credential formats", () => {
     expect(redactSecrets(GLPAT)).toContain("[REDACTED:gitlab]")
     expect(redactSecrets(NVAPI)).toContain("[REDACTED:nvidia]")
     expect(redactSecrets(`Bearer ${LIQUID}`)).toBe("Bearer [REDACTED:liquid]")
-    expect(redactSecrets("liquid_ui and liquid_layout")).toBe("liquid_ui and liquid_layout")
+    // Liquid template identifiers are not keys.
+    for (const text of [
+      "liquid_ui and liquid_layout",
+      "liquid_template_rendering_engine_configuration",
+      "{% liquid_layout_engine_config %}",
+    ])
+      expect(redactSecrets(text)).toBe(text)
     expect(redactSecrets(TELEGRAM)).toContain("[REDACTED:telegram]")
   })
 
