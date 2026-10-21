@@ -55,16 +55,24 @@ export function createSystemOneInvoker(
       ? "OPENCODE_API_KEY"
       : providerID === "commandcode"
         ? "CMD_API_KEY"
-        : "TYPESAFE_API_KEY"
+        : providerID === "liquid-ai"
+          ? "LIQUID_API_KEY"
+          : "TYPESAFE_API_KEY"
   const apiKey = process.env[keyName]?.trim()
   if (!apiKey) throw new Error(`Missing ${keyName} for System One reviewer ${config.model}`)
+  // Other providers also read LIQUID_API_KEY; never send a foreign key to Liquid AI.
+  if (providerID === "liquid-ai" && !apiKey.startsWith("liquid_")) {
+    throw new Error(`LIQUID_API_KEY is not a Liquid AI key (expected the "liquid_" prefix)`)
+  }
   const client = new TypeSafeClient({
     apiKey,
     ...(providerID === "opencode"
       ? { baseURL: "https://opencode.ai/zen" }
       : providerID === "commandcode"
         ? { baseURL: "https://api.commandcode.ai/provider" }
-        : {}),
+        : providerID === "liquid-ai"
+          ? { baseURL: "https://api.liquid.ai/decisions" }
+          : {}),
     defaultModel: modelID,
     logLevel: "off",
     timeout: config.timeoutMs,

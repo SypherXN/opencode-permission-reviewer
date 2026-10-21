@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Liquid AI `liquid-ai/d1` and `liquid-ai/d1-ultra` as System One reviewer
+  models, with the key read from `LIQUID_API_KEY`. A key without Liquid AI's
+  `liquid_` prefix is never sent and the review fails closed (#94, thanks
+  @giannisCKS).
+
 ### Changed
 
 - Bumped the `@opencode/client` runtime dependency to 2.1.1.

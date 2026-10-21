@@ -96,13 +96,18 @@ describe("System One reviewer", () => {
     expect(isSystemOneReviewerModel("opencode/jev-1.13-free")).toBe(true)
     expect(isSystemOneReviewerModel("typesafe-ai/jev-latest")).toBe(true)
     expect(isSystemOneReviewerModel("commandcode/typesafe/jev")).toBe(true)
+    expect(isSystemOneReviewerModel("liquid-ai/d1")).toBe(true)
+    expect(isSystemOneReviewerModel("liquid-ai/d1-ultra")).toBe(true)
+    expect(isSystemOneReviewerModel("liquid-ai/d1-other")).toBe(false)
+    expect(isSystemOneReviewerModel("liquid/d1")).toBe(false)
+    expect(isSystemOneReviewerModel("other/d1-ultra")).toBe(false)
     expect(isSystemOneReviewerModel("commandcode/jev-1.13")).toBe(false)
     expect(isSystemOneReviewerModel("commandcode/typesafe/other")).toBe(false)
     expect(isSystemOneReviewerModel("other/jev-1.13")).toBe(false)
     expect(isSystemOneReviewerModel("opencode/not-jev")).toBe(false)
   })
 
-  test("routes Zen, TypeSafe, and Command Code through their System One endpoints", async () => {
+  test("routes Zen, TypeSafe, Command Code, and Liquid through their System One endpoints", async () => {
     const providers = [
       {
         model: "opencode/jev-1.13",
@@ -122,13 +127,25 @@ describe("System One reviewer", () => {
         keyName: "CMD_API_KEY",
         url: "https://api.commandcode.ai/provider/v1/systemone",
       },
+      {
+        model: "liquid-ai/d1",
+        returnedModel: "d1",
+        keyName: "LIQUID_API_KEY",
+        url: "https://api.liquid.ai/decisions/v1/systemone",
+      },
+      {
+        model: "liquid-ai/d1-ultra",
+        returnedModel: "d1-ultra",
+        keyName: "LIQUID_API_KEY",
+        url: "https://api.liquid.ai/decisions/v1/systemone",
+      },
     ] as const
     const previousBaseURL = process.env.TYPESAFE_BASE_URL
     delete process.env.TYPESAFE_BASE_URL
     try {
       for (const provider of providers) {
         const previousKey = process.env[provider.keyName]
-        const apiKey = `synthetic-${provider.keyName.toLowerCase()}`
+        const apiKey = `${provider.keyName === "LIQUID_API_KEY" ? "liquid" + "_" : ""}synthetic-${provider.keyName.toLowerCase()}`
         process.env[provider.keyName] = apiKey
         try {
           const config = resolveConfig({ model: provider.model })
@@ -166,6 +183,54 @@ describe("System One reviewer", () => {
   test("rejects an unexpected returned model from Command Code", () => {
     const config = resolveConfig({ model: "commandcode/typesafe/jev" })
     expect(parseSystemOneReview({ ...response(), model: "jev-1.13" }, config)).toBeUndefined()
+  })
+
+  test("rejects a returned model other than the configured Liquid model", () => {
+    const config = resolveConfig({ model: "liquid-ai/d1" })
+    const valid = { ...response(), model: "d1" }
+    expect(parseSystemOneReview(valid, config)?.decision.outcome).toBe("allow")
+    for (const model of ["d1-ultra", "jev-1.13", "liquid-ai/d1"]) {
+      expect(parseSystemOneReview({ ...valid, model }, config)).toBeUndefined()
+    }
+    expect(
+      parseSystemOneReview(valid, resolveConfig({ model: "typesafe-ai/jev-latest" })),
+    ).toBeUndefined()
+  })
+
+  test("never sends a non-Liquid key to Liquid AI", async () => {
+    const previous = process.env.LIQUID_API_KEY
+    const typesafeKey = process.env.TYPESAFE_API_KEY
+    try {
+      delete process.env.LIQUID_API_KEY
+      process.env.TYPESAFE_API_KEY = "synthetic-typesafe-key"
+      expect(() => createSystemOneInvoker(resolveConfig({ model: "liquid-ai/d1" }))).toThrow(
+        /Missing LIQUID_API_KEY/,
+      )
+
+      // Another provider's key stored under the same variable name.
+      process.env.LIQUID_API_KEY = "synthetic-foreign-router-key"
+      const config = resolveConfig({ model: "liquid-ai/d1-ultra", escalationMode: "deny" })
+      let calls = 0
+      expect(() =>
+        createSystemOneInvoker(config, async () => {
+          calls++
+          return Response.json({ ...response(), model: "d1-ultra" })
+        }),
+      ).toThrow(/not a Liquid AI key/)
+      const result = await new SystemOneReviewerBackend(config).review(
+        envelope(),
+        new ReviewAttempt("generation", 10_000),
+      )
+      expect(calls).toBe(0)
+      expect(result.kind).toBe("deny")
+      expect(result.decisionSource).toBe("failure-safe")
+      expect(result.reason).not.toContain("synthetic-foreign-router-key")
+    } finally {
+      if (previous === undefined) delete process.env.LIQUID_API_KEY
+      else process.env.LIQUID_API_KEY = previous
+      if (typesafeKey === undefined) delete process.env.TYPESAFE_API_KEY
+      else process.env.TYPESAFE_API_KEY = typesafeKey
+    }
   })
 
   test("does not borrow a TypeSafe key for a Command Code request", () => {

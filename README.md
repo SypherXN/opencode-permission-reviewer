@@ -235,6 +235,7 @@ this call. The supported routes are:
 | `opencode/jev-1.13` (or `opencode/jev-1.13-free`)      | `OPENCODE_API_KEY`            | [OpenCode Zen](https://opencode.ai/docs/en/zen/#jev)                                          |
 | `typesafe-ai/jev-1.13.0` (or `typesafe-ai/jev-latest`) | `TYPESAFE_API_KEY`            | [TypeSafe AI](https://docs.typesafe.ai/sdk/javascript)                                        |
 | `commandcode/typesafe/jev`                             | `CMD_API_KEY`                 | [Command Code Provider API](https://commandcode.ai/docs/provider#decision-models-typesafejev) |
+| `liquid-ai/d1` (or `liquid-ai/d1-ultra`)               | `LIQUID_API_KEY`              | [Liquid AI](https://docs.liquid.ai/lfm/models/d1)                                             |
 
 For **Jev only**, omit `escalationReviewer`:
 
@@ -251,6 +252,12 @@ provider. Command Code requires an API-enabled plan such as GOAT, Pro, Max,
 Team, or Provider; the Go plan has no Provider API access. Use a Command Code
 API key from Studio in `CMD_API_KEY`. Jev is a headless decision model there,
 so it cannot be selected as an interactive Command Code chat model.
+
+Liquid AI's d1 decision models use the same typed System One questions and
+calibration as Jev. Create a key in the Liquid Console; its keys start with
+`liquid_`. Other providers, such as the `liquid` inference router in OpenCode's
+model catalog, also read `LIQUID_API_KEY`, so the plugin refuses to send a key
+without that prefix and the review follows the failure settings instead.
 
 For **Jev with selective reasoning escalation**, add a chat model already
 configured in OpenCode:

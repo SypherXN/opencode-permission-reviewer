@@ -470,10 +470,12 @@ export function isSystemOneReviewerModel(model: string): boolean {
   } catch {
     return false
   }
-  // Jev uses the typed System One API rather than a chat-session transport.
+  // Jev and Liquid d1 use the typed System One API rather than a chat-session transport.
   return (
     ((parsed.providerID === "opencode" || parsed.providerID === "typesafe-ai") &&
       /^jev(?:-|$)/.test(parsed.modelID)) ||
-    (parsed.providerID === "commandcode" && parsed.modelID === "typesafe/jev")
+    (parsed.providerID === "commandcode" && parsed.modelID === "typesafe/jev") ||
+    (parsed.providerID === "liquid-ai" &&
+      (parsed.modelID === "d1" || parsed.modelID === "d1-ultra"))
   )
 }
