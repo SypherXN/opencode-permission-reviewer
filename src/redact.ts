@@ -109,10 +109,17 @@ const RULES: ReadonlyArray<{ re: RegExp; replace: (match: string, groups: string
   },
   // Then lowercase credential keywords as standalone-ish keys (also catches the
   // bare forms private_key / passphrase / credential that the compound rule
-  // above misses because it requires a leading identifier).
+  // above misses because it requires a leading identifier). A session key whose
+  // whole value is exactly an OpenCode session ID (ses_ + 12 hex time digits +
+  // random base62) is a public identifier the reviewer needs for intent and
+  // lineage, not a credential.
   {
     re: /(^|_|[^A-Za-z0-9_])(api[_-]?key|access[_-]?token|secret[_-]?key|client[_-]?secret|secret|password|passwd|token|cookie|csrf[_-]?token|session[_-]?id|sessionid|session|sid|private[_-]?key|passphrase|credentials?)(["']?\s*[:=]\s*["']?)(?!\[REDACTED)([^$`{}()\s"'#[\]]{8,})/gi,
-    replace: (_m, g) => `${g[0] ?? ""}${g[1] ?? ""}${g[2] ?? ""}${REDACT("credential")}`,
+    replace: (m, g) =>
+      /^(?:session[_-]?id|session|sid)$/i.test(g[1] ?? "") &&
+      /^ses_[0-9a-f]{12}[A-Za-z0-9]{14}(?:[A-Za-z0-9]{6})?$/.test(g[3] ?? "")
+        ? m
+        : `${g[0] ?? ""}${g[1] ?? ""}${g[2] ?? ""}${REDACT("credential")}`,
   },
 ]
 

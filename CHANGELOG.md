@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- OpenCode session IDs in reviewer evidence (intent, actor, and lineage) are no
+  longer masked as credentials, so the reviewer can tell which session each
+  piece of intent came from. Other values assigned to session keys are still
+  redacted.
 - On OpenCode V2, package script evidence starts from the shell command's
   `workdir`, resolving relative paths against the session directory, instead of
   always using the session directory. The `workdir` is followed to its real

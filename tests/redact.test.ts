@@ -225,6 +225,23 @@ describe("redactSecrets — credential formats", () => {
     expect(redactSecrets("csrf_token=abcdef1234567890abcd")).not.toContain("abcdef1234567890")
   })
 
+  test("keeps OpenCode session IDs but not lookalike secrets", () => {
+    const id = "ses_" + "0a1b2c3d4e5f" + "AbCdEfGhIjKlMn"
+    const longId = id + "OpQrSt"
+    for (const text of [
+      `INTENT actor=user session=${id} message=msg_01`,
+      `{"sessionID": "${longId}"}`,
+      `sid=${id}`,
+    ])
+      expect(redactSecrets(text)).toBe(text)
+    // Only a whole value with the exact ID shape, and only under a session key.
+    expect(redactSecrets(`session=${id}x`)).toContain("[REDACTED:credential]")
+    expect(redactSecrets(`session=${id}/secretvalue`)).not.toContain("secretvalue")
+    expect(redactSecrets(`session=ses_${"Z".repeat(26)}`)).toContain("[REDACTED:credential]")
+    expect(redactSecrets(`password=${id}`)).not.toContain(id)
+    expect(redactSecrets(`token=${id}`)).not.toContain(id)
+  })
+
   test("redacts private_key / passphrase / credential assignments", () => {
     const val = (c: string) => c.repeat(8)
     expect(redactSecrets(`private_key=${val("a")}`)).not.toContain("aaaaaaaa")
