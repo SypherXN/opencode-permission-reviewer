@@ -25,12 +25,13 @@ describe("explain CLI", () => {
   })
 
   test("parses a bash fixture and prints capability + policyTrace", async () => {
-    // The effective config reads the developer's global permission-reviewer.jsonc;
-    // an empty HOME keeps a local enforcementMode out of this assertion.
+    // The effective config reads the developer's global and project
+    // permission-reviewer.jsonc; an empty HOME and project keep a local
+    // enforcementMode out of this assertion.
     const home = mkdtempSync(join(tmpdir(), "reviewer-explain-"))
     try {
       const proc = Bun.spawn({
-        cmd: ["bun", "run", "src/cli/explain.ts"],
+        cmd: ["bun", "run", "src/cli/explain.ts", "--project", home],
         cwd: import.meta.dir + "/..",
         env: { ...process.env, HOME: home },
         stdin: new TextEncoder().encode(
