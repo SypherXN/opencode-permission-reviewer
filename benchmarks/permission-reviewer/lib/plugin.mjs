@@ -68,7 +68,22 @@ export async function sourceSnapshot(repo) {
   }
 }
 const prov = (value, source = "session-api") => ({ value, source, confidence: "high" })
-function humanBlocks(messages) {
+const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+/** Expand a fixture session ID to OpenCode's shape (ses_ + 12 hex + 14 base62), deterministically. */
+export function openCodeSessionID(fixture) {
+  const digest = createHash("sha256").update(fixture).digest()
+  const random = [...digest.subarray(6, 20)].map((b) => BASE62[b % 62]).join("")
+  return `ses_${digest.subarray(0, 6).toString("hex")}${random}`
+}
+const intentBlock = (actor, text, sessionID, messageID, createdAt) => ({
+  sessionID,
+  messageID,
+  actor,
+  text,
+  synthetic: false,
+  ...(createdAt === undefined ? {} : { createdAt }),
+})
+function humanBlocks(messages, sessionID, actor = "user") {
   return messages
     .filter((m) => m.info.role === "user")
     .flatMap((m) =>
@@ -83,7 +98,7 @@ function humanBlocks(messages) {
               p.text.trim(),
             ),
         )
-        .map((p) => ({ actor: "user", text: p.text, createdAt: m.info.time?.created })),
+        .map((p) => intentBlock(actor, p.text, sessionID, m.info.id, m.info.time?.created)),
     )
 }
 /** Import only the reviewed pure/core layers. Never import index.ts, host backends or evidence providers with filesystem/SSH access. */
@@ -144,15 +159,18 @@ export async function openPlugin(repo, { allowDrift = false, allowNode = false }
   function envelopeFor(input, cfg) {
     const messages = structuredClone(input.messages),
       request = structuredClone(input.request)
+    request.sessionID = openCodeSessionID(request.sessionID)
     const delegated = input.delegatedSession === true
+    const rootSessionID = delegated ? openCodeSessionID("ses_root_fixture") : request.sessionID
+    const lastUser = messages.findLast((m) => m.info.role === "user")?.info.id ?? "msg_000"
+    const block = (actor, sessionID) => (x) =>
+      typeof x === "string" ? intentBlock(actor, x, sessionID, lastUser) : x
     const direct = input.directUserIntent?.length
-      ? input.directUserIntent.map((x) => (typeof x === "string" ? { actor: "user", text: x } : x))
+      ? input.directUserIntent.map(block("user", rootSessionID))
       : delegated
         ? []
-        : humanBlocks(messages)
-    const tasks = (input.delegatedTask ?? []).map((x) =>
-      typeof x === "string" ? { actor: "assistant", text: x } : x,
-    )
+        : humanBlocks(messages, request.sessionID)
+    const tasks = (input.delegatedTask ?? []).map(block("assistant", rootSessionID))
     const e = {
       request,
       directory: input.directory,
@@ -167,14 +185,14 @@ export async function openPlugin(repo, { allowDrift = false, allowNode = false }
         mode: prov("primary"),
         profile: prov(input.actorProfile ?? "workspace", "global-config"),
         identityCompleteness: "complete",
-        rootSessionID: prov(delegated ? "ses_root_fixture" : request.sessionID),
+        rootSessionID: prov(rootSessionID),
         delegationDepth: prov(delegated ? 1 : 0),
-        parentSessionID: prov(delegated ? "ses_root_fixture" : undefined),
+        parentSessionID: prov(delegated ? rootSessionID : undefined),
       },
       lineage: {
         origin: delegated ? "delegated" : "human-root",
         depth: delegated ? 1 : 0,
-        rootSessionID: delegated ? "ses_root_fixture" : request.sessionID,
+        rootSessionID,
         cycleDetected: false,
         truncated: false,
         missingParents: [],
@@ -185,7 +203,7 @@ export async function openPlugin(repo, { allowDrift = false, allowNode = false }
             mode: "primary",
           },
           ...(delegated
-            ? [{ sessionID: "ses_root_fixture", actorName: "coordinator", mode: "primary" }]
+            ? [{ sessionID: rootSessionID, actorName: "coordinator", mode: "primary" }]
             : []),
         ],
       },
@@ -198,7 +216,15 @@ export async function openPlugin(repo, { allowDrift = false, allowNode = false }
               .flatMap((m) =>
                 m.parts
                   .filter((p) => p.type === "text")
-                  .map((p) => ({ actor: "assistant", text: p.text })),
+                  .map((p) =>
+                    intentBlock(
+                      "assistant",
+                      p.text,
+                      request.sessionID,
+                      m.info.id,
+                      m.info.time?.created,
+                    ),
+                  ),
               )
           : [],
       },

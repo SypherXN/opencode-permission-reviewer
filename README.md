@@ -233,7 +233,7 @@ this call. The supported routes are:
 | Reviewer `model`                                                                                               | Required environment variable | System One API                                                                                |
 | -------------------------------------------------------------------------------------------------------------- | ----------------------------- | --------------------------------------------------------------------------------------------- |
 | `opencode/jev-1.13` (or `opencode/jev-1.13-free`)                                                              | `OPENCODE_API_KEY`            | [OpenCode Zen](https://opencode.ai/docs/en/zen/#jev)                                          |
-| `typesafe-ai/jev-1.13.0` (or `typesafe-ai/jev-latest`)                                                         | `TYPESAFE_API_KEY`            | [TypeSafe AI](https://docs.typesafe.ai/sdk/javascript)                                        |
+| `typesafe-ai/jev-1.14.0` (or `typesafe-ai/jev-latest`)                                                         | `TYPESAFE_API_KEY`            | [TypeSafe AI](https://docs.typesafe.ai/sdk/javascript)                                        |
 | `commandcode/typesafe/jev`                                                                                     | `CMD_API_KEY`                 | [Command Code Provider API](https://commandcode.ai/docs/provider#decision-models-typesafejev) |
 | `liquid-ai/d1` (or `liquid-ai/d1-ultra`)                                                                       | `LIQUID_API_KEY`              | [Liquid AI](https://docs.liquid.ai/lfm/models/d1)                                             |
 | `baseten/decision-models/baseten-mammoth-27b-latest` (or `baseten/decision-models/baseten-elephant-9b-latest`) | `BASETEN_API_KEY`             | [Baseten](https://docs.baseten.co/inference/model-apis/decision-models)                       |
@@ -254,12 +254,17 @@ Team, or Provider; the Go plan has no Provider API access. Use a Command Code
 API key from Studio in `CMD_API_KEY`. Jev is a headless decision model there,
 so it cannot be selected as an interactive Command Code chat model.
 
-Liquid AI's d1 decision models use the same typed System One questions and the
-same thresholds as Jev. On the synthetic PRB-600 corpus, `liquid-ai/d1-ultra`
-alone made no dangerous, unsupported, or critical approvals; with an
-`escalationReviewer`, set `systemOneReasoningThreshold` to `0.6` for it. The
+Liquid AI's d1 and Baseten's mammoth-1 and elephant-1 decision models use the
+same typed System One questions and the same thresholds as Jev. On the synthetic
+PRB-600 corpus, `baseten/decision-models/baseten-mammoth-27b-latest` scored
+highest, alone or with a reasoning reviewer, with the default thresholds. Jev
+1.14 gains the most from an `escalationReviewer`. `liquid-ai/d1-ultra` alone
+made no false denials; with an `escalationReviewer`, set
+`systemOneReasoningThreshold` to `0.6` for it. elephant-1 needs
+`systemOneConfidenceThreshold: 0.6` to avoid unsupported approvals, and the
 smaller `liquid-ai/d1` made unsupported approvals at every threshold and is not
-recommended. See the [benchmark results](./benchmarks/permission-reviewer/RESULTS.md#liquid-d1-and-d1-ultra-system-one). Create a key in
+recommended. See the
+[benchmark results](./benchmarks/permission-reviewer/RESULTS.md#decision-models-system-one). For Liquid AI, create a key in
 the Liquid Console; its keys start with `liquid_`. Other providers, such as the
 `liquid` inference router in OpenCode's model catalog, also read
 `LIQUID_API_KEY`, so the plugin refuses to send a key that is not shaped like a
