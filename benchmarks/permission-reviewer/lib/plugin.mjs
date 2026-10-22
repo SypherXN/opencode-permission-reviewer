@@ -3,24 +3,25 @@ import { execFileSync } from "node:child_process"
 import { resolve, join } from "node:path"
 import { pathToFileURL } from "node:url"
 import { createHash } from "node:crypto"
+import { isBasetenSystemOne, isLiquidSystemOne } from "./providers.mjs"
 import { assert, sha256 } from "./util.mjs"
 
 // Git blob hashes of the security-critical files actually inspected for this kit.
 export const PINNED_BLOBS = {
   "src/policy.ts": "72dc68cc8de6f536b196e3ffbe840f8b2236cd01",
   "src/context.ts": "5473abbe19ccce27163ceaaf87a63e63e6d5215a",
-  "src/config.ts": "9b4722fbc5eaa7d029608c51ec8bdcbd829bda81",
+  "src/config.ts": "ff59656385164efa2ed963f632b7fa62fd223bc1",
   "src/decision.ts": "ad3443f3bf2ca1b34b3b23e8115c79148e19238b",
   "src/policy/policy-engine.ts": "b4470dc188d956cc0ed25454c2d34465110fe1be",
   "src/escalation.ts": "947f5ed665600927e21be343995cdc4993a45f5a",
   "src/core/review-engine.ts": "e17f72c6775191d8c20fb0d8b24bbf339272dc23",
   "src/emergency-brake.ts": "f583b97b7d917b785c39ab208faa80b45fb6b6e8",
-  "src/redact.ts": "e93e4d379b64866de9848a8a5a9b5d7b1e4a8f3e",
+  "src/redact.ts": "27f14d86cee160ca4d759b13bc681212ddc649c5",
   "src/capability/command-parser.ts": "926def261a0f1af1eec4a5991a89eb24da32af59",
   "src/capability/bash-analyzer.ts": "9837e06aa8908acc75b788de775af0ad168b3b6d",
   "src/shell-lexer.ts": "869f76267044afeaa1cf75b0330b3e34b11395dd",
   "src/capability/heredoc-extractor.ts": "de3c1bb00f5d7e430c86845455ce6de6b1c94f6c",
-  "src/system-one/review.ts": "5ab2c36e4dd19634b9de7a02ffeb9937414112e2",
+  "src/system-one/review.ts": "af86e3e95bcb19d7ef892612982ce8515a07f52a",
 }
 const gitBlob = (bytes) => {
   // Pins are LF git blobs. A Windows checkout may store CRLF; the extra
@@ -71,7 +72,22 @@ export async function sourceSnapshot(repo) {
   }
 }
 const prov = (value, source = "session-api") => ({ value, source, confidence: "high" })
-function humanBlocks(messages) {
+const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+/** Expand a fixture session ID to OpenCode's shape (ses_ + 12 hex + 14 base62), deterministically. */
+export function openCodeSessionID(fixture) {
+  const digest = createHash("sha256").update(fixture).digest()
+  const random = [...digest.subarray(6, 20)].map((b) => BASE62[b % 62]).join("")
+  return `ses_${digest.subarray(0, 6).toString("hex")}${random}`
+}
+const intentBlock = (actor, text, sessionID, messageID, createdAt) => ({
+  sessionID,
+  messageID,
+  actor,
+  text,
+  synthetic: false,
+  ...(createdAt === undefined ? {} : { createdAt }),
+})
+function humanBlocks(messages, sessionID, actor = "user") {
   return messages
     .filter((m) => m.info.role === "user")
     .flatMap((m) =>
@@ -86,7 +102,7 @@ function humanBlocks(messages) {
               p.text.trim(),
             ),
         )
-        .map((p) => ({ actor: "user", text: p.text, createdAt: m.info.time?.created })),
+        .map((p) => intentBlock(actor, p.text, sessionID, m.info.id, m.info.time?.created)),
     )
 }
 /** Import only the reviewed pure/core layers. Never import index.ts, host backends or evidence providers with filesystem/SSH access. */
@@ -133,7 +149,11 @@ export async function openPlugin(repo, { allowDrift = false, allowNode = false }
       model:
         model?.transport === "system-one" && model.model === "typesafe/jev"
           ? "commandcode/typesafe/jev"
-          : (model?.model ?? base.model),
+          : isLiquidSystemOne(model)
+            ? `liquid-ai/${model.model}`
+            : isBasetenSystemOne(model)
+              ? `baseten/${model.model}`
+              : (model?.model ?? base.model),
       variant: model?.variant ?? base.variant,
       outputFormat: model?.format === "text" ? "text" : "json_schema",
       audit: false,
@@ -143,15 +163,18 @@ export async function openPlugin(repo, { allowDrift = false, allowNode = false }
   function envelopeFor(input, cfg) {
     const messages = structuredClone(input.messages),
       request = structuredClone(input.request)
+    request.sessionID = openCodeSessionID(request.sessionID)
     const delegated = input.delegatedSession === true
+    const rootSessionID = delegated ? openCodeSessionID("ses_root_fixture") : request.sessionID
+    const lastUser = messages.findLast((m) => m.info.role === "user")?.info.id ?? "msg_000"
+    const block = (actor, sessionID) => (x) =>
+      typeof x === "string" ? intentBlock(actor, x, sessionID, lastUser) : x
     const direct = input.directUserIntent?.length
-      ? input.directUserIntent.map((x) => (typeof x === "string" ? { actor: "user", text: x } : x))
+      ? input.directUserIntent.map(block("user", rootSessionID))
       : delegated
         ? []
-        : humanBlocks(messages)
-    const tasks = (input.delegatedTask ?? []).map((x) =>
-      typeof x === "string" ? { actor: "assistant", text: x } : x,
-    )
+        : humanBlocks(messages, request.sessionID)
+    const tasks = (input.delegatedTask ?? []).map(block("assistant", rootSessionID))
     const e = {
       request,
       directory: input.directory,
@@ -166,14 +189,14 @@ export async function openPlugin(repo, { allowDrift = false, allowNode = false }
         mode: prov("primary"),
         profile: prov(input.actorProfile ?? "workspace", "global-config"),
         identityCompleteness: "complete",
-        rootSessionID: prov(delegated ? "ses_root_fixture" : request.sessionID),
+        rootSessionID: prov(rootSessionID),
         delegationDepth: prov(delegated ? 1 : 0),
-        parentSessionID: prov(delegated ? "ses_root_fixture" : undefined),
+        parentSessionID: prov(delegated ? rootSessionID : undefined),
       },
       lineage: {
         origin: delegated ? "delegated" : "human-root",
         depth: delegated ? 1 : 0,
-        rootSessionID: delegated ? "ses_root_fixture" : request.sessionID,
+        rootSessionID,
         cycleDetected: false,
         truncated: false,
         missingParents: [],
@@ -184,7 +207,7 @@ export async function openPlugin(repo, { allowDrift = false, allowNode = false }
             mode: "primary",
           },
           ...(delegated
-            ? [{ sessionID: "ses_root_fixture", actorName: "coordinator", mode: "primary" }]
+            ? [{ sessionID: rootSessionID, actorName: "coordinator", mode: "primary" }]
             : []),
         ],
       },
@@ -197,7 +220,15 @@ export async function openPlugin(repo, { allowDrift = false, allowNode = false }
               .flatMap((m) =>
                 m.parts
                   .filter((p) => p.type === "text")
-                  .map((p) => ({ actor: "assistant", text: p.text })),
+                  .map((p) =>
+                    intentBlock(
+                      "assistant",
+                      p.text,
+                      request.sessionID,
+                      m.info.id,
+                      m.info.time?.created,
+                    ),
+                  ),
               )
           : [],
       },

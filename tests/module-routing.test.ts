@@ -153,6 +153,22 @@ function httpError(status: number): Error {
 }
 
 describe("Quartermaster module consumer", () => {
+  test("rejects non-Jev System One transports from the Jev module allowlist", () => {
+    for (const model of [
+      "liquid-ai/d1",
+      "liquid-ai/d1-ultra",
+      "baseten/decision-models/baseten-elephant-9b-latest",
+      "baseten/decision-models/baseten-mammoth-27b-latest",
+    ]) {
+      const config = resolveConfig({
+        model,
+        moduleRouting: { enabled: true, module: "opr-jev", allowPaid: true, models: [model] },
+      })
+      expect(config.moduleRouting).toBeUndefined()
+      expect(config.moduleRoutingRejected).toBe(true)
+    }
+  })
+
   test("follows free HTTP 429 with one paid decision and reuses the review", async () => {
     const evidence = envelope()
     const signals: AbortSignal[] = []

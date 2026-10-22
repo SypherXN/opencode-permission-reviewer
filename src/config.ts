@@ -507,7 +507,7 @@ export function isFreeSystemOneModel(providerID: string, modelID: string): boole
   return (
     providerID === "opencode" &&
     modelID.endsWith("-free") &&
-    isSystemOneReviewerModel(`${providerID}/${modelID}`)
+    isJevSystemOneModel(`${providerID}/${modelID}`)
   )
 }
 
@@ -544,7 +544,7 @@ export function isValidModuleRouting(
     } catch {
       return false
     }
-    if (!isSystemOneReviewerModel(model)) return false
+    if (!isJevSystemOneModel(model)) return false
     const key = `${parsed.providerID}\0${parsed.modelID}`
     if (seen.has(key)) return false
     seen.add(key)
@@ -568,6 +568,21 @@ export function resolveModuleRouting(value: unknown): {
   }
 }
 
+/** Jev-specific check for Quartermaster's Jev-only module profile. */
+function isJevSystemOneModel(model: string): boolean {
+  let parsed: { providerID: string; modelID: string }
+  try {
+    parsed = splitModel(model)
+  } catch {
+    return false
+  }
+  return (
+    ((parsed.providerID === "opencode" || parsed.providerID === "typesafe-ai") &&
+      /^jev(?:-|$)/.test(parsed.modelID)) ||
+    (parsed.providerID === "commandcode" && parsed.modelID === "typesafe/jev")
+  )
+}
+
 export function isSystemOneReviewerModel(model: string): boolean {
   let parsed: { providerID: string; modelID: string }
   try {
@@ -575,10 +590,20 @@ export function isSystemOneReviewerModel(model: string): boolean {
   } catch {
     return false
   }
-  // Jev uses the typed System One API rather than a chat-session transport.
+  // Jev, Liquid d1, and Baseten's decision models use the typed System One API
+  // rather than a chat-session transport.
   return (
     ((parsed.providerID === "opencode" || parsed.providerID === "typesafe-ai") &&
       /^jev(?:-|$)/.test(parsed.modelID)) ||
-    (parsed.providerID === "commandcode" && parsed.modelID === "typesafe/jev")
+    (parsed.providerID === "commandcode" && parsed.modelID === "typesafe/jev") ||
+    (parsed.providerID === "liquid-ai" &&
+      (parsed.modelID === "d1" || parsed.modelID === "d1-ultra")) ||
+    (parsed.providerID === "baseten" && BASETEN_DECISION_MODELS.has(parsed.modelID))
   )
 }
+
+/** Baseten's System One decision models (elephant-1 and mammoth-1). */
+export const BASETEN_DECISION_MODELS: ReadonlySet<string> = new Set([
+  "decision-models/baseten-elephant-9b-latest",
+  "decision-models/baseten-mammoth-27b-latest",
+])
