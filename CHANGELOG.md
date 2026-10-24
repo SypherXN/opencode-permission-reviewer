@@ -37,9 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Bumped the `@opencode/client` runtime dependency to 2.1.2.
+- Bumped the `@opencode/client` runtime dependency to 2.1.3.
 - Bumped the `zod` runtime dependency to 4.6.7.
-- Verified with OpenCode V1 1.19.3 and V2 2.1.2.
+- Verified with OpenCode V1 1.19.4 and V2 2.1.3.
 
 ## [2.4.3] - 2026-10-14
 
