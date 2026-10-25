@@ -45,6 +45,8 @@ function fixture(
     activationFailed?: boolean
     failFirstActivation?: boolean
     activationDelayed?: boolean
+    holdPrompt?: () => Promise<void> | void
+    missingSession?: "name" | "dotted" | "present"
     activationRepresentation?: "directory-slash" | "file-url" | "id-only" | "id-new-path"
     mcpServers?: boolean | "after-first"
     pluginMcp?: boolean
@@ -230,6 +232,7 @@ function fixture(
         }
       },
       prompt: async ({ sessionID: current }: { sessionID: string }) => {
+        await options.holdPrompt?.()
         prompts++
         const readDefinition = { description: "Native read schema" }
         const shellDefinition = { description: "Native shell schema" }
@@ -311,7 +314,18 @@ function fixture(
         removed.add(current)
       },
       get: async ({ sessionID: current }: { sessionID: string }) => {
-        if (removed.has(current)) throw { _tag: "SessionNotFoundError" }
+        if (removed.has(current)) {
+          if (options.missingSession === "present") return { id: current }
+          if (options.missingSession === "name") {
+            throw Object.assign(new Error("SessionNotFoundError: session is gone"), {
+              name: "SessionNotFoundError",
+            })
+          }
+          if (options.missingSession === "dotted") {
+            throw { _tag: "Session.NotFoundError", message: "Session not found" }
+          }
+          throw { _tag: "SessionNotFoundError" }
+        }
         return { id: current }
       },
     },
@@ -382,6 +396,7 @@ function fixture(
       hostCleanup = await plugin.default.setup({ ...ctx, location: { directory } })
       setups++
     },
+    guard: (id: string, name = "shell") => toolHook({ sessionID: id, tool: name }),
     unrelated: () => {
       const event: ContextEvent = {
         sessionID: "ses_other",
@@ -724,6 +739,48 @@ test("review sessions share one MCP-free location without mixing concurrent evid
   }
 })
 
+test("a deleted isolation location is replaced only after its reviewer sessions finish", async () => {
+  let release: () => void = () => {}
+  let entered = false
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const harness = fixture({
+    holdPrompt: () => {
+      if (entered) return
+      entered = true
+      return gate
+    },
+  })
+  try {
+    const first = harness.run()
+    while (!entered) await new Promise((resolve) => setTimeout(resolve, 5))
+    const original = harness.state().directory
+    await rm(original, { recursive: true, force: true })
+    expect((await harness.run()).kind).toBe("allow")
+    expect(harness.state().setups).toBe(1)
+    expect(harness.state().directory).toBe(original)
+    release()
+    expect((await first).kind).toBe("allow")
+    expect((await harness.run()).kind).toBe("allow")
+    const state = harness.state()
+    expect(state.setups).toBe(2)
+    expect(state.directory).not.toBe(original)
+    expect(state.directories).toEqual([original, state.directory])
+    const isolatedConfig = JSON.parse(await readFile(state.directory + "/opencode.json", "utf8"))
+    expect(isolatedConfig.plugins).toEqual([
+      "-opencode.config.mcp",
+      "-quartermaster",
+      state.directory,
+    ])
+    expect(existsSync(original)).toBe(false)
+    expect(existsSync(state.directory + "/index.js")).toBe(true)
+  } finally {
+    release()
+    await harness.cleanup()
+  }
+})
+
 test("reviewer fails closed when its isolated location contains MCP servers", async () => {
   const harness = fixture({ mcpServers: true })
   try {
@@ -771,6 +828,48 @@ test("an inert bootstrap reload keeps stripping MCP after the backend releases i
     await harness.reload()
     expect(harness.state().mcpTransforms).toBe(1)
     expect(await harness.mcp()).toEqual([])
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("a host SessionNotFound error without _tag still confirms cleanup", async () => {
+  const harness = fixture({ missingSession: "name" })
+  try {
+    const result = await harness.run()
+    expect(result.kind).toBe("allow")
+    expect(harness.backend.owns(harness.state().sessionID)).toBe(false)
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("a host Session.NotFoundError tag confirms cleanup", async () => {
+  const harness = fixture({ missingSession: "dotted" })
+  try {
+    const result = await harness.run()
+    expect(result.kind).toBe("allow")
+    expect(harness.backend.owns(harness.state().sessionID)).toBe(false)
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("an unconfirmed reviewer session does not block the next review", async () => {
+  const harness = fixture({ missingSession: "present" })
+  try {
+    await expect(harness.run()).rejects.toThrow("cleanup could not be confirmed")
+    const stuck = harness.state().sessionID
+    expect(harness.backend.owns(stuck)).toBe(true)
+    expect(() => harness.guard(stuck)).toThrow("Operational tools")
+    const original = harness.state().directory
+    await rm(original, { recursive: true, force: true })
+    await expect(harness.run()).rejects.toThrow("cleanup could not be confirmed")
+    const state = harness.state()
+    expect(state.directory).not.toBe(original)
+    expect(state.setups).toBe(2)
+    expect(state.sessionIDs).toHaveLength(2)
+    expect(() => harness.guard(stuck)).toThrow("Operational tools")
   } finally {
     await harness.cleanup()
   }

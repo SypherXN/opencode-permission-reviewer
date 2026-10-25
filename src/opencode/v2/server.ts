@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
 import type { Plugin } from "@opencode/plugin"
-import type { OpenCodeEvent } from "@opencode/client"
+import type { OpenCodeClient, OpenCodeEvent } from "@opencode/client"
 import { loadResolvedConfig } from "../../config/loader.ts"
 import { isSystemOneReviewerModel, reviewBudgetMs } from "../../config.ts"
 import { createAuditWriter } from "../../audit.ts"
@@ -13,6 +13,7 @@ import { createUiStatus, type ReviewUiStatus } from "../../ui-protocol.ts"
 import { ReviewerRpc } from "../../ui/rpc.ts"
 import type { ReviewEnvelope, ReviewExecutionResult } from "../../types.ts"
 import { connectV2Host } from "./connection.ts"
+import { createInProcessReviewClient } from "./in-process-client.ts"
 import { createV2ContextReader } from "./context-reader.ts"
 import { normalizeV2Permission } from "./permission-codec.ts"
 import { createV2ReviewerBackend, type V2ReviewBackend } from "./backend-factory.ts"
@@ -29,9 +30,32 @@ type Context = Parameters<Plugin.Plugin["setup"]>[0]
 export async function setup(ctx: Context): Promise<() => Promise<void>> {
   return setupWithServices(ctx, {
     loadConfig: loadResolvedConfig,
-    connect: connectV2Host,
+    connect: (directory, identity, version, signal) =>
+      connectReviewHost(ctx, directory, identity, version, signal),
     createBackend: createV2ReviewerBackend,
   })
+}
+
+/**
+ * Use the plugin context when this process is the host. An explicit URL still
+ * opens a separate HTTP connection and keeps its identity check. A missing
+ * registration is not a connection to some other process.
+ */
+export function connectReviewHost(
+  ctx: Context,
+  directory: string,
+  identity: string,
+  version: string,
+  signal: AbortSignal,
+): Promise<OpenCodeClient> {
+  if (process.env.OPENCODE_PERMISSION_REVIEWER_HOST_URL !== undefined)
+    return connectV2Host(directory, identity, version, signal)
+  if (signal.aborted) {
+    const reason =
+      signal.reason instanceof Error ? signal.reason : new Error("Reviewer host connection aborted")
+    return Promise.reject(reason)
+  }
+  return Promise.resolve(createInProcessReviewClient(ctx))
 }
 
 /** Host effects are injectable without changing the plugin entry contract. */

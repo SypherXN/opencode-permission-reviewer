@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto"
+import { stat } from "node:fs/promises"
 import { join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import type { OpenCodeClient } from "@opencode/client"
@@ -51,12 +52,50 @@ interface ReviewerLocation {
   release(): void
 }
 
+function errorMark(error: unknown): string {
+  const seen = new Set<unknown>()
+  const label = (value: unknown, depth: number): string | undefined => {
+    if (depth > 4 || typeof value !== "object" || value === null || seen.has(value)) return
+    seen.add(value)
+    const record = value as Record<string, unknown>
+    const tag = record._tag ?? record.tag ?? record.name
+    if (typeof tag === "string" && tag.length > 0) return tag
+    return label(record.cause, depth + 1) ?? label(record.error, depth + 1)
+  }
+  const message = error instanceof Error ? error.message : undefined
+  const text = [label(error, 0), message].filter((item): item is string => Boolean(item)).join(": ")
+  return (text || "unrecognized error").slice(0, 160)
+}
+
+function sessionNotFoundTag(tag: unknown): boolean {
+  return tag === "SessionNotFoundError" || tag === "Session.NotFoundError"
+}
+
+function sessionGone(error: unknown): boolean {
+  const seen = new Set<unknown>()
+  const visit = (value: unknown): boolean => {
+    if (typeof value !== "object" || value === null || seen.has(value)) return false
+    seen.add(value)
+    const record = value as Record<string, unknown>
+    const tag = record._tag ?? record.tag ?? record.name
+    if (sessionNotFoundTag(tag)) return true
+    if (typeof record.message === "string" && /Session\.?NotFound/i.test(record.message))
+      return true
+    return visit(record.cause) || visit(record.error)
+  }
+  return visit(error)
+}
+
 /** Owns auxiliary sessions and host hooks, never operational permission replies. */
 export class V2ReviewerBackend {
   private readonly sessions = new Map<string, PendingGeneration>()
+  /** Finished reviews whose deletion could not be confirmed. They keep tool guards
+   *  without counting as in-flight work. */
+  private readonly retained = new Set<string>()
   private readonly jobs = new Set<Promise<ReviewExecutionResult>>()
   private readonly locationAbort = new AbortController()
   private locationPromise: Promise<ReviewerLocation> | undefined
+  private locationGate: Promise<void> = Promise.resolve()
   private disposal?: Promise<void>
   private closing = false
   constructor(
@@ -65,7 +104,7 @@ export class V2ReviewerBackend {
   ) {}
 
   owns(sessionID: string): boolean {
-    return this.sessions.has(sessionID)
+    return this.sessions.has(sessionID) || this.retained.has(sessionID)
   }
 
   async register(ctx: Context = this.ctx): Promise<() => Promise<void>> {
@@ -81,7 +120,12 @@ export class V2ReviewerBackend {
             input: resultSchema,
             execute: async (input, execution) => {
               const pending = this.sessions.get(execution.sessionID)
-              if (!pending?.attempt.active() || pending.closing || !pending.structured)
+              if (
+                this.retained.has(execution.sessionID) ||
+                !pending?.attempt.active() ||
+                pending.closing ||
+                !pending.structured
+              )
                 throw new Error("Not an active structured reviewer session")
               const decision = parseDecision(input)
               if (!decision) throw new Error("Invalid review decision")
@@ -96,6 +140,7 @@ export class V2ReviewerBackend {
       registrations.push(
         await ctx.session.hook("context", (event) => {
           const pending = this.sessions.get(event.sessionID)
+          if (this.retained.has(event.sessionID)) throw new Error("Review no longer active")
           if (!pending) {
             delete event.tools[TOOL]
             return
@@ -124,7 +169,8 @@ export class V2ReviewerBackend {
         registrations.push(
           await ctx.session.hook("http.request", async (event) => {
             const pending = this.sessions.get(event.sessionID)
-            if (!pending?.attempt.active() || pending.closing) return
+            if (this.retained.has(event.sessionID) || !pending?.attempt.active() || pending.closing)
+              return
             const capture = await captureRequestTools(event.request)
             console.error(
               "permission-reviewer request-tools " +
@@ -141,7 +187,10 @@ export class V2ReviewerBackend {
       registrations.push(
         await ctx.tool.hook("execute.before", (event) => {
           const pending = this.sessions.get(event.sessionID)
-          if (pending && (pending.closing || event.tool !== TOOL)) {
+          if (
+            this.retained.has(event.sessionID) ||
+            (pending && (pending.closing || event.tool !== TOOL))
+          ) {
             throw new Error("Operational tools are disabled in reviewer sessions")
           }
         }),
@@ -179,7 +228,7 @@ export class V2ReviewerBackend {
       await this.waitForIdle()
       const location = await this.locationPromise?.catch(() => undefined)
       // An uncertain session deletion must retain the guards in its cached location.
-      if (!location || this.sessions.size > 0) return
+      if (!location || this.sessions.size > 0 || this.retained.size > 0) return
       try {
         await location.dispose()
       } finally {
@@ -190,7 +239,39 @@ export class V2ReviewerBackend {
   }
 
   private ensureLocation(client: OpenCodeClient): Promise<ReviewerLocation> {
-    if (this.locationPromise) return this.locationPromise
+    const run = this.locationGate.then(() => this.ensureLocationLocked(client))
+    this.locationGate = run.then(
+      () => undefined,
+      () => undefined,
+    )
+    return run
+  }
+
+  private async ensureLocationLocked(client: OpenCodeClient): Promise<ReviewerLocation> {
+    const current = this.locationPromise
+    if (current) {
+      const location = await current.catch(() => undefined)
+      if (this.locationPromise !== current) return this.ensureLocationLocked(client)
+      // A live reviewer session still depends on this location's guards.
+      if (
+        location &&
+        ((await isolationFilesIntact(location.directory)) || this.sessions.size > 0 || this.closing)
+      )
+        return location
+      if (location) {
+        this.locationPromise = undefined
+        try {
+          await location.dispose()
+        } finally {
+          location.release()
+        }
+      }
+    }
+    if (this.locationPromise) return this.ensureLocationLocked(client)
+    return this.rememberLocation(client)
+  }
+
+  private rememberLocation(client: OpenCodeClient): Promise<ReviewerLocation> {
     const location = this.openLocation(client)
     this.locationPromise = location
     void location.catch(() => {
@@ -390,6 +471,7 @@ export class V2ReviewerBackend {
       const pending = this.sessions.get(id)
       if (pending) pending.closing = true
       let cleanupConfirmed = !createIssued
+      let cleanupFault = "session remained readable"
       try {
         if (createIssued) {
           for (let retry = 0; retry < 2 && !cleanupConfirmed; retry++) {
@@ -400,8 +482,8 @@ export class V2ReviewerBackend {
               )
               if (this.config.retainReviewSessions) cleanupConfirmed = true
             } catch (error) {
-              if ((error as { _tag?: string })?._tag === "SessionNotFoundError")
-                cleanupConfirmed = true
+              cleanupFault = errorMark(error)
+              if (sessionGone(error)) cleanupConfirmed = true
             }
             if (!this.config.retainReviewSessions && !cleanupConfirmed) {
               try {
@@ -409,13 +491,16 @@ export class V2ReviewerBackend {
                   { sessionID: id },
                   { signal: AbortSignal.timeout(2000) },
                 )
-              } catch {
+              } catch (error) {
                 // A lost response is not proof that deletion failed or succeeded.
+                cleanupFault = errorMark(error)
               }
               try {
                 await client.session.get({ sessionID: id }, { signal: AbortSignal.timeout(2000) })
+                cleanupFault = "session remained readable"
               } catch (error) {
-                cleanupConfirmed = (error as { _tag?: string })?._tag === "SessionNotFoundError"
+                cleanupFault = errorMark(error)
+                cleanupConfirmed = sessionGone(error)
               }
             }
           }
@@ -423,11 +508,15 @@ export class V2ReviewerBackend {
             // Cleanup uncertainty must override a provisional allow; the controller fails closed.
             // eslint-disable-next-line no-unsafe-finally
             throw new Error(
-              "Reviewer cleanup could not be confirmed; isolation guards remain active",
+              `Reviewer cleanup could not be confirmed; isolation guards remain active (${cleanupFault})`,
             )
         }
       } finally {
-        if (cleanupConfirmed) this.sessions.delete(id)
+        // The attempt is finished. An unconfirmed session keeps its tool guard, but it
+        // is no longer in-flight, so it cannot block the next review or pin a dead location.
+        this.sessions.delete(id)
+        if (cleanupConfirmed || !createIssued) this.retained.delete(id)
+        else this.retained.add(id)
       }
     }
   }
@@ -441,6 +530,18 @@ export class V2ReviewerBackend {
  * failure fails loudly. The attempt deadline still bounds the wait, and a
  * transport error rejects like any other reviewer failure.
  */
+async function isolationFilesIntact(directory: string): Promise<boolean> {
+  try {
+    const files = await Promise.all(
+      ["index.js", "package.json", "opencode.json"].map((name) => stat(join(directory, name))),
+    )
+    return files.every((file) => file.isFile())
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false
+    throw error
+  }
+}
+
 async function waitForIsolationActive(
   client: OpenCodeClient,
   directory: string,

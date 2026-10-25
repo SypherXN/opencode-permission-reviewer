@@ -19,6 +19,7 @@ import {
 } from "./module-routing.ts"
 import {
   enforceParsedSystemOneReview,
+  explainSystemOneRejection,
   parseSystemOneReview,
   SYSTEM_ONE_QUESTIONS,
   type SystemOneState,
@@ -173,10 +174,18 @@ export class SystemOneReviewerBackend {
   ): Promise<ReviewExecutionResult> {
     const parsed = parseSystemOneReview(response, config)
     if (!parsed) {
+      const rejection = explainSystemOneRejection(response, config)
+      this.logger?.("System One reviewer response was rejected", {
+        model: rejection.model,
+        answerKeys: rejection.answerKeys,
+        check: rejection.check,
+      })
+      const returned =
+        typeof rejection.model === "string" ? ` (returned model ${rejection.model})` : ""
       return applyEscalationDisposition(
         {
           kind: "escalate",
-          reason: "System One reviewer returned a missing, invalid, or ambiguous decision.",
+          reason: `System One reviewer returned a missing, invalid, or ambiguous decision: ${rejection.check}${returned}.`,
           decisionSource: "failure-safe",
           reviewerModel: config.model,
         },

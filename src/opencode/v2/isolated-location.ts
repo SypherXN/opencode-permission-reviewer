@@ -4,6 +4,7 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import type { Plugin } from "@opencode/plugin"
+import { forgetIsolationContext, noteIsolationContext } from "./in-process-client.ts"
 
 type Context = Parameters<Plugin.Plugin["setup"]>[0]
 type Activate = (ctx: Context) => Promise<() => Promise<void>>
@@ -33,6 +34,8 @@ export async function createIsolatedLocation(
   activations.set(key, async (ctx) => {
     if (ctx.location.directory !== directory)
       throw new Error("Reviewer isolation location mismatch")
+    // plugin.list and model.list on the host context cannot see this directory.
+    noteIsolationContext(directory, ctx)
     return activate(ctx)
   })
   // The local config only disables the config MCP loader, so servers that other plugins add
@@ -71,10 +74,12 @@ export async function createIsolatedLocation(
       pluginID,
       release: () => {
         activations.delete(key)
+        forgetIsolationContext(directory)
       },
     }
   } catch (error) {
     activations.delete(key)
+    forgetIsolationContext(directory)
     await rm(directory, { recursive: true, force: true })
     throw error
   }

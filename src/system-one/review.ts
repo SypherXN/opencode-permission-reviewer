@@ -182,34 +182,55 @@ function finiteProbability(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1
 }
 
+type ChoiceParse<T extends readonly string[]> = {
+  choice: T[number]
+  confidence: number
+  probabilities: Record<T[number], number>
+}
+
 function parseChoice<T extends readonly string[]>(
   value: unknown,
   options: T,
-): { choice: T[number]; confidence: number; probabilities: Record<T[number], number> } | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return
+): { choice: ChoiceParse<T> } | { check: string } {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return { check: "answer is not an object" }
   const answer = value as Record<string, unknown>
-  if (answer.type !== "choice" || !options.includes(answer.choice as T[number])) return
-  if (!finiteProbability(answer.confidence)) return
-  if (typeof answer.probabilities !== "object" || answer.probabilities === null) return
+  if (answer.type !== "choice") return { check: "type is not choice" }
+  if (!options.includes(answer.choice as T[number]))
+    return { check: "choice is outside the question" }
+  if (!finiteProbability(answer.confidence)) return { check: "confidence is not a probability" }
+  if (
+    typeof answer.probabilities !== "object" ||
+    answer.probabilities === null ||
+    Array.isArray(answer.probabilities)
+  )
+    return { check: "probabilities are missing" }
   const probabilities = answer.probabilities as Record<string, unknown>
-  if (!exactKeys(probabilities, options)) return
+  if (!exactKeys(probabilities, options))
+    return { check: "probability keys do not match the question" }
   const values = Object.values(probabilities)
-  if (!values.every(finiteProbability)) return
+  if (!values.every(finiteProbability)) return { check: "a probability is invalid" }
   const total = (values as number[]).reduce((sum, probability) => sum + probability, 0)
-  if (total < 0.98 || total > 1.02) return
+  if (total < 0.98 || total > 1.02) return { check: "probabilities do not sum to 1" }
   const selected = probabilities[answer.choice as T[number]] as number
-  if (selected < Math.max(...(values as number[]))) return
+  if (selected < Math.max(...(values as number[])))
+    return { check: "chosen label is not the top probability" }
   return {
-    choice: answer.choice as T[number],
-    confidence: answer.confidence,
-    probabilities: probabilities as Record<T[number], number>,
+    choice: {
+      choice: answer.choice as T[number],
+      confidence: answer.confidence,
+      probabilities: probabilities as Record<T[number], number>,
+    },
   }
 }
 
-function parseNoul(value: unknown): number | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return
+function parseNoul(value: unknown): { noul: number } | { check: string } {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return { check: "answer is not an object" }
   const answer = value as Record<string, unknown>
-  return answer.type === "noul" && finiteProbability(answer.noul) ? answer.noul : undefined
+  if (answer.type !== "noul") return { check: "type is not noul" }
+  if (!finiteProbability(answer.noul)) return { check: "noul is not a probability" }
+  return { noul: answer.noul }
 }
 
 const BASIS_RATIONALE: Record<(typeof BASES)[number], string> = {
@@ -235,25 +256,63 @@ const SAFE_BASES = new Set<(typeof BASES)[number]>([
   "authorized_reversible_change",
 ])
 
+export interface SystemOneRejection {
+  model: unknown
+  answerKeys: string[]
+  check: string
+}
+
+/** Why a System One body cannot become a decision. No answer values are included. */
+export function explainSystemOneRejection(
+  response: SystemOneResult<typeof SYSTEM_ONE_QUESTIONS> | unknown,
+  config: ReviewerConfig,
+): SystemOneRejection {
+  const read = readSystemOneReview(response, config)
+  return "rejection" in read
+    ? read.rejection
+    : {
+        model: read.review.returnedModel,
+        answerKeys: Object.keys(SYSTEM_ONE_QUESTIONS),
+        check: "accepted",
+      }
+}
+
 export function parseSystemOneReview(
   response: SystemOneResult<typeof SYSTEM_ONE_QUESTIONS> | unknown,
   config: ReviewerConfig,
 ): ParsedSystemOneReview | undefined {
-  if (typeof response !== "object" || response === null || Array.isArray(response)) return
+  const read = readSystemOneReview(response, config)
+  return "review" in read ? read.review : undefined
+}
+
+function readSystemOneReview(
+  response: SystemOneResult<typeof SYSTEM_ONE_QUESTIONS> | unknown,
+  config: ReviewerConfig,
+): { review: ParsedSystemOneReview } | { rejection: SystemOneRejection } {
+  const reject = (model: unknown, answerKeys: string[], check: string) =>
+    ({ rejection: { model, answerKeys, check } }) as const
+  if (typeof response !== "object" || response === null || Array.isArray(response))
+    return reject(undefined, [], "response is not an object")
   const raw = response as Record<string, unknown>
+  const answerKeys =
+    typeof raw.answers === "object" && raw.answers !== null && !Array.isArray(raw.answers)
+      ? Object.keys(raw.answers)
+      : []
+  if (typeof raw.model !== "string") return reject(raw.model, answerKeys, "model is not a string")
   if (
-    typeof raw.model !== "string" ||
-    (config.model === "commandcode/typesafe/jev"
+    config.model === "commandcode/typesafe/jev"
       ? raw.model !== "typesafe/jev"
       : config.model.startsWith("liquid-ai/") || config.model.startsWith("baseten/")
         ? raw.model !== config.model.slice(config.model.indexOf("/") + 1)
-        : !/^jev(?:-|$)/.test(raw.model))
+        : !/^jev(?:-|$)/.test(raw.model)
   )
-    return
-  if (typeof raw.answers !== "object" || raw.answers === null || Array.isArray(raw.answers)) return
+    return reject(raw.model, answerKeys, "model does not match the configured System One reviewer")
+  if (typeof raw.answers !== "object" || raw.answers === null || Array.isArray(raw.answers))
+    return reject(raw.model, answerKeys, "answers are missing")
   const answers = raw.answers as Record<string, unknown>
   const expected = Object.keys(SYSTEM_ONE_QUESTIONS)
-  if (!exactKeys(answers, expected)) return
+  if (!exactKeys(answers, expected))
+    return reject(raw.model, answerKeys, "answer keys do not match the System One questions")
 
   const outcome = parseChoice(answers.outcome, OUTCOMES)
   const risk = parseChoice(answers.risk_level, RISKS)
@@ -261,38 +320,69 @@ export function parseSystemOneReview(
   const alignment = parseChoice(answers.scope_alignment, ALIGNMENTS)
   const completeness = parseChoice(answers.evidence_completeness, COMPLETENESS)
   const basis = parseChoice(answers.primary_basis, BASES)
-  if (!outcome || !risk || !authorization || !alignment || !completeness || !basis) return
-
-  const signals = {
-    materialAuthorization: parseNoul(answers.material_authorization),
-    withinIntentScope: parseNoul(answers.within_intent_scope),
-    unauthorizedDataLoss: parseNoul(answers.unauthorized_data_loss),
-    untrustedSensitiveDisclosure: parseNoul(answers.untrusted_sensitive_disclosure),
-    excessiveCredentialAccess: parseNoul(answers.excessive_credential_access),
-    unauthorizedSecurityChange: parseNoul(answers.unauthorized_security_change),
-    unauthorizedExternalMutation: parseNoul(answers.unauthorized_external_mutation),
-    essentialEvidenceMissing: parseNoul(answers.essential_evidence_missing),
-    absolutePolicyDeny: parseNoul(answers.absolute_policy_deny),
+  for (const [name, parsed] of [
+    ["outcome", outcome],
+    ["risk_level", risk],
+    ["user_authorization", authorization],
+    ["scope_alignment", alignment],
+    ["evidence_completeness", completeness],
+    ["primary_basis", basis],
+  ] as const) {
+    if ("check" in parsed) return reject(raw.model, answerKeys, `${name}: ${parsed.check}`)
   }
-  if (Object.values(signals).some((value) => value === undefined)) return
-  const s = signals as Record<keyof typeof signals, number>
+  if (
+    !("choice" in outcome) ||
+    !("choice" in risk) ||
+    !("choice" in authorization) ||
+    !("choice" in alignment) ||
+    !("choice" in completeness) ||
+    !("choice" in basis)
+  )
+    return reject(raw.model, answerKeys, "a choice answer failed")
+
+  const signalAnswers = {
+    materialAuthorization: answers.material_authorization,
+    withinIntentScope: answers.within_intent_scope,
+    unauthorizedDataLoss: answers.unauthorized_data_loss,
+    untrustedSensitiveDisclosure: answers.untrusted_sensitive_disclosure,
+    excessiveCredentialAccess: answers.excessive_credential_access,
+    unauthorizedSecurityChange: answers.unauthorized_security_change,
+    unauthorizedExternalMutation: answers.unauthorized_external_mutation,
+    essentialEvidenceMissing: answers.essential_evidence_missing,
+    absolutePolicyDeny: answers.absolute_policy_deny,
+  }
+  const signals = {} as Record<keyof typeof signalAnswers, number>
+  for (const [name, value] of Object.entries(signalAnswers) as Array<
+    [keyof typeof signalAnswers, unknown]
+  >) {
+    const parsed = parseNoul(value)
+    if ("check" in parsed) return reject(raw.model, answerKeys, `${name}: ${parsed.check}`)
+    signals[name] = parsed.noul
+  }
+  const s = signals
+  const outcomeChoice = outcome.choice
+  const riskChoice = risk.choice
+  const authorizationChoice = authorization.choice
+  const alignmentChoice = alignment.choice
+  const completenessChoice = completeness.choice
+  const basisChoice = basis.choice
 
   const supportingConfidence = Math.min(
-    risk.confidence,
-    authorization.confidence,
-    alignment.confidence,
-    completeness.confidence,
-    basis.confidence,
+    riskChoice.confidence,
+    authorizationChoice.confidence,
+    alignmentChoice.confidence,
+    completenessChoice.confidence,
+    basisChoice.confidence,
   )
   const decision: ReviewDecision = {
     version: 2,
-    outcome: outcome.choice,
-    risk_level: risk.choice,
-    user_authorization: authorization.choice,
-    scope_alignment: alignment.choice,
-    evidence_completeness: completeness.choice,
-    rationale: BASIS_RATIONALE[basis.choice],
-    confidence: outcome.confidence,
+    outcome: outcomeChoice.choice,
+    risk_level: riskChoice.choice,
+    user_authorization: authorizationChoice.choice,
+    scope_alignment: alignmentChoice.choice,
+    evidence_completeness: completenessChoice.choice,
+    rationale: BASIS_RATIONALE[basisChoice.choice],
+    confidence: outcomeChoice.confidence,
   }
 
   const contradictions: string[] = []
@@ -303,9 +393,9 @@ export function parseSystemOneReview(
   }
   if (decision.outcome === "allow" && supportingConfidence < 0.3)
     contradictions.push("a supporting classification has very low confidence")
-  if (decision.outcome === "allow" && !SAFE_BASES.has(basis.choice))
+  if (decision.outcome === "allow" && !SAFE_BASES.has(basisChoice.choice))
     contradictions.push("an allow used a restrictive primary basis")
-  if (decision.outcome === "deny" && SAFE_BASES.has(basis.choice))
+  if (decision.outcome === "deny" && SAFE_BASES.has(basisChoice.choice))
     contradictions.push("a deny used an approving primary basis")
   if (decision.scope_alignment === "aligned" && s.withinIntentScope < 0.3)
     contradictions.push("scope alignment conflicts with the intent-scope signal")
@@ -358,16 +448,18 @@ export function parseSystemOneReview(
         ? `System One decision is uncertain or inconsistent: ${[...new Set(contradictions)].join("; ")}.`
         : undefined
   return {
-    decision,
-    primaryBasis: basis.choice,
-    ...(difficultReason === undefined ? {} : { difficultReason }),
-    reasoningRecommended:
-      difficultReason !== undefined &&
-      (decision.outcome === "allow" ||
-        (decision.outcome === "escalate" &&
-          outcome.probabilities.allow + outcome.probabilities.deny >=
-            config.systemOneReasoningThreshold)),
-    returnedModel: raw.model,
+    review: {
+      decision,
+      primaryBasis: basisChoice.choice,
+      ...(difficultReason === undefined ? {} : { difficultReason }),
+      reasoningRecommended:
+        difficultReason !== undefined &&
+        (decision.outcome === "allow" ||
+          (decision.outcome === "escalate" &&
+            outcomeChoice.probabilities.allow + outcomeChoice.probabilities.deny >=
+              config.systemOneReasoningThreshold)),
+      returnedModel: raw.model,
+    },
   }
 }
 

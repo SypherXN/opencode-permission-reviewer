@@ -5,6 +5,7 @@ import { createSystemOneInvoker, SystemOneReviewerBackend } from "../src/system-
 import {
   enforceParsedSystemOneReview,
   enforceSystemOneDecision,
+  explainSystemOneRejection,
   parseSystemOneReview,
   SYSTEM_ONE_QUESTIONS,
 } from "../src/system-one/review.ts"
@@ -209,6 +210,38 @@ describe("System One reviewer", () => {
   test("rejects an unexpected returned model from Command Code", () => {
     const config = resolveConfig({ model: "commandcode/typesafe/jev" })
     expect(parseSystemOneReview({ ...response(), model: "jev-1.13" }, config)).toBeUndefined()
+  })
+
+  test("records why a System One body was rejected without copying answer values", async () => {
+    const config = resolveConfig({ model: "opencode/jev-1.13-free" })
+    const raw = { ...response(), model: "typesafe/jev-paid" }
+    const rejection = explainSystemOneRejection(raw, config)
+    expect(rejection.check).toBe("model does not match the configured System One reviewer")
+    expect(rejection.model).toBe("typesafe/jev-paid")
+    expect(JSON.stringify(rejection)).not.toContain("authorized_routine")
+    const notes: unknown[] = []
+    const backend = new SystemOneReviewerBackend(
+      config,
+      undefined,
+      undefined,
+      async () => raw,
+      undefined,
+      undefined,
+      undefined,
+      (_message, details) => notes.push(details),
+    )
+    const result = await backend.review(envelope(), new ReviewAttempt("generation", 10_000))
+    expect(result.kind).toBe("escalate")
+    expect(result.reason).toContain("model does not match the configured System One reviewer")
+    expect(result.reason).toContain("typesafe/jev-paid")
+    expect(result.reason).not.toContain("authorized_routine")
+    expect(notes).toEqual([
+      {
+        model: "typesafe/jev-paid",
+        answerKeys: Object.keys(SYSTEM_ONE_QUESTIONS),
+        check: "model does not match the configured System One reviewer",
+      },
+    ])
   })
 
   test("rejects a returned model other than the configured Liquid model", () => {
