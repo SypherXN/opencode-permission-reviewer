@@ -100,23 +100,23 @@ test("in-process calls target the isolation directory and its own plugin context
         seen.push(["create", input.id, input.location.directory, options?.signal])
         return { id: input.id, location: input.location }
       },
-      prompt: async (input: { sessionID: string; location?: unknown }) => {
-        seen.push(["prompt", input.sessionID, input.location])
-        return { id: "inbox" }
+      prompt: async () => {
+        throw new Error("host session.prompt")
       },
-      wait: async (input: { sessionID: string }) => {
-        seen.push(["wait", input.sessionID])
+      wait: async () => {
+        throw new Error("host session.wait")
       },
-      interrupt: async (input: { sessionID: string }) => {
-        seen.push(["interrupt", input.sessionID])
+      interrupt: async () => {
+        throw new Error("host session.interrupt")
       },
-      remove: async (input: { sessionID: string }) => {
-        seen.push(["remove", input.sessionID])
+      remove: async () => {
+        throw new Error("host session.remove")
       },
-      get: async (input: { sessionID: string }) => ({ id: input.sessionID }),
-      context: async (input: { sessionID: string }) => {
-        seen.push(["context", input.sessionID])
-        return []
+      get: async () => {
+        throw new Error("host session.get")
+      },
+      context: async () => {
+        throw new Error("host session.context")
       },
     },
   }
@@ -162,6 +162,26 @@ test("in-process calls target the isolation directory and its own plugin context
           location: { directory },
           data: [{ providerID: "fixture", id: "reviewer" }],
         }),
+      },
+      session: {
+        prompt: async (input: { sessionID: string; location?: unknown }) => {
+          seen.push(["prompt", input.sessionID, input.location])
+          return { id: "inbox" }
+        },
+        wait: async (input: { sessionID: string }) => {
+          seen.push(["wait", input.sessionID])
+        },
+        interrupt: async (input: { sessionID: string }) => {
+          seen.push(["interrupt", input.sessionID])
+        },
+        remove: async (input: { sessionID: string }) => {
+          seen.push(["remove", input.sessionID])
+        },
+        get: async (input: { sessionID: string }) => ({ id: input.sessionID }),
+        context: async (input: { sessionID: string }) => {
+          seen.push(["context", input.sessionID])
+          return []
+        },
       },
     })
     const plugins = (await client.plugin.list({ location: { directory } })).data as Array<{
@@ -250,6 +270,62 @@ test("a created isolation session is prompted and deleted on that location", asy
     })
     await client.session.remove({ sessionID: "ses_review" })
     expect(seen).toEqual(["host.create", "isolation.prompt", "host.get", "isolation.remove"])
+  } finally {
+    forgetIsolationContext(directory)
+  }
+})
+
+test("a missing isolation context does not ask the host about an owned session", async () => {
+  const directory = "/tmp/opencode-reviewer-isolation-gone"
+  const seen: string[] = []
+  const host = {
+    mcp: { list: async () => ({ data: [] }) },
+    session: {
+      create: async (input: { id: string; location: { directory: string } }) => {
+        seen.push("host.create")
+        return { id: input.id, location: input.location }
+      },
+      prompt: async () => {
+        seen.push("host.prompt")
+      },
+      get: async () => {
+        seen.push("host.get")
+        return { id: "ses_user", location: { directory: "/workspace" } }
+      },
+      remove: async () => {
+        seen.push("host.remove")
+      },
+    },
+  }
+  noteIsolationContext(directory, {
+    location: { directory },
+    plugin: { list: async () => ({ location: { directory }, data: [] }) },
+    model: { list: async () => ({ location: { directory }, data: [] }) },
+    session: {
+      prompt: async () => {
+        seen.push("isolation.prompt")
+      },
+    },
+  })
+  const client = createInProcessReviewClient(host as unknown as Context)
+  try {
+    await client.session.create({
+      id: "ses_review",
+      title: "Permission review",
+      location: { directory },
+    })
+    await expect(client.session.remove({ sessionID: "ses_review" })).rejects.toThrow(
+      "isolation session is not reachable",
+    )
+    forgetIsolationContext(directory)
+    await expect(
+      client.session.prompt({ sessionID: "ses_review", text: "review" }),
+    ).rejects.toThrow("isolation session is not reachable")
+    await expect(client.session.remove({ sessionID: "ses_review" })).rejects.toThrow(
+      "isolation session is not reachable",
+    )
+    await client.session.get({ sessionID: "ses_user" })
+    expect(seen).toEqual(["host.create", "host.get"])
   } finally {
     forgetIsolationContext(directory)
   }

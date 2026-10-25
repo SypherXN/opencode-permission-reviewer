@@ -867,6 +867,39 @@ describe("Quartermaster module consumer", () => {
     )
     const timedOut = await hung.select(new AbortController().signal)
     expect(timedOut).toMatchObject({ status: "unavailable", reasonCode: "timeout" })
+
+    let invoked = 0
+    const thrown = createQuartermasterModuleClient(
+      {
+        rpc: () => ({
+          async selectModule() {
+            throw new Error("schema mismatch")
+          },
+          async reportModuleCooldown() {
+            throw new Error("unused")
+          },
+        }),
+      },
+      1_000,
+    )
+    const broken = await thrown.select(new AbortController().signal)
+    expect(broken).toMatchObject({ status: "unavailable", reasonCode: "invalid-response" })
+    const backend = new SystemOneReviewerBackend(
+      route(true),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      thrown,
+      () => async () => {
+        invoked++
+        return response("jev-1.13-free")
+      },
+    )
+    const denied = await backend.review(envelope(), new ReviewAttempt("generation", 10_000))
+    expect(denied.decisionSource).toBe("failure-safe")
+    expect(denied.reason).toContain("module selection is unavailable (invalid-response)")
+    expect(invoked).toBe(0)
   })
 
   test("falls back to the configured reviewer model when Quartermaster cannot answer", async () => {

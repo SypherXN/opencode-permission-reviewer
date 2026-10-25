@@ -423,7 +423,13 @@ async function callModuleMethod(
     if (controller.signal.aborted) return { status: "unavailable", reasonCode }
     return result
   } catch (error) {
-    const code = signal.aborted ? "cancelled" : reasonCode
+    // A timeout is Quartermaster not answering. Any other throw is a broken
+    // call, not permission to use the configured model.
+    const code = signal.aborted
+      ? "cancelled"
+      : controller.signal.aborted
+        ? reasonCode
+        : "invalid-response"
     logger?.("Quartermaster module RPC failed", { reasonCode: code, error: String(error) })
     return {
       status: "unavailable",

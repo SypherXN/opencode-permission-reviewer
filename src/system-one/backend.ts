@@ -243,12 +243,11 @@ export class SystemOneReviewerBackend {
         await attempt.wait(this.modules.select(attempt.signal)),
       )
       const selected = permitSelectedModel(routing, selection, blocked)
-      // Quartermaster could not be reached (it threw or timed out) means no
-      // decision came back at all, not a refusal. Fall back to the trusted
-      // configured reviewer model, under the same allowlist and paid-use
-      // policy, instead of failing the review closed. An explicit Quartermaster
-      // decision (no module, no eligible model) and a broken contract still
-      // fail closed.
+      // A timeout or an explicit service-unavailable answer is not a
+      // Quartermaster decision. The trusted configured model may be used, under
+      // the same allowlist and paid-use policy. A thrown call, a cancelled
+      // call, no module, no eligible model, and a broken contract still fail
+      // closed.
       let chosen = selected
       if (!selected.ok) {
         const fallback = permitFallbackModel(routing, selection, this.config.model, blocked)

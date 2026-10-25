@@ -78,8 +78,10 @@ function assertInventoryLocation(
  *
  * `mcp.list` and `session.create` accept another directory. A session created
  * there belongs to that location, so prompt, wait, and cleanup run on the
- * isolation plugin context. `plugin.list` and `model.list` do too, after that
- * plugin activates. The HTTP identity check is not used here.
+ * isolation plugin context. If that context is gone, those calls fail instead
+ * of asking the host, which cannot see the session. `plugin.list` and
+ * `model.list` do too, after that plugin activates. The HTTP identity check
+ * is not used here.
  */
 export function createInProcessReviewClient(host: Context): OpenCodeClient {
   const ownedSessions = new Map<string, string>()
@@ -122,15 +124,16 @@ export function createInProcessReviewClient(host: Context): OpenCodeClient {
   const sessionTarget = (name: string, sessionID: unknown): object => {
     if (typeof sessionID !== "string") return host.session
     const directory = ownedSessions.get(sessionID)
-    const isolated = directory
-      ? (isolationContexts.get(locationKey(directory))?.session as
-          Record<string, unknown> | undefined)
-      : undefined
-    if (!isolated || typeof isolated[name] !== "function") return host.session
+    if (!directory) return host.session
+    const isolated = isolationContexts.get(locationKey(directory))?.session as
+      Record<string, unknown> | undefined
+    if (!isolated || typeof isolated[name] !== "function") {
+      throw new Error("Reviewer isolation session is not reachable")
+    }
     return isolated
   }
   const sessionCall = (name: string) => {
-    return (...args: unknown[]) => {
+    return async (...args: unknown[]) => {
       const input = args[0] as { sessionID?: unknown } | undefined
       return method(sessionTarget(name, input?.sessionID), name)(...args)
     }
