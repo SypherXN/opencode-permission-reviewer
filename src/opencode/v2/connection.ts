@@ -8,6 +8,7 @@ import { ReviewerRpc } from "../../ui/rpc.ts"
 interface ServiceEndpoint {
   url: string
   password: string
+  pid: number
 }
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"])
@@ -87,7 +88,16 @@ async function readRegisteredService(version: string): Promise<ServiceEndpoint |
     throw new Error("Reviewer registered service must use a loopback address")
   if (endpoint.pathname !== "/" || endpoint.search || endpoint.hash)
     throw new Error("Reviewer registered service URL must be a loopback origin")
-  return { url: endpoint.href, password: info.password }
+  return { url: endpoint.href, password: info.password, pid: info.pid as number }
+}
+
+/**
+ * True when the registered service is the process this plugin runs inside.
+ * A registration owned by another process cannot serve this host's sessions.
+ */
+export async function registeredServiceIsSelf(version: string): Promise<boolean> {
+  const endpoint = await readRegisteredService(version).catch(() => undefined)
+  return endpoint?.pid === process.pid
 }
 
 function makeClient(endpoint: ServiceEndpoint): OpenCodeClient {

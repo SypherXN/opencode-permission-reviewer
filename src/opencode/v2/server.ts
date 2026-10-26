@@ -12,7 +12,7 @@ import { evaluateReview } from "../../core/review-engine.ts"
 import { createUiStatus, type ReviewUiStatus } from "../../ui-protocol.ts"
 import { ReviewerRpc } from "../../ui/rpc.ts"
 import type { ReviewEnvelope, ReviewExecutionResult } from "../../types.ts"
-import { connectV2Host } from "./connection.ts"
+import { connectV2Host, registeredServiceIsSelf } from "./connection.ts"
 import { createInProcessReviewClient } from "./in-process-client.ts"
 import { createV2ContextReader } from "./context-reader.ts"
 import { normalizeV2Permission } from "./permission-codec.ts"
@@ -38,10 +38,11 @@ export async function setup(ctx: Context): Promise<() => Promise<void>> {
 
 /**
  * Use the plugin context when this process is the host. An explicit URL still
- * opens a separate HTTP connection and keeps its identity check. A missing
- * registration is not a connection to some other process.
+ * opens a separate HTTP connection and keeps its identity check. A service
+ * registration owned by this process serves its own sessions over HTTP; one
+ * owned by another process is a different host and is not used.
  */
-export function connectReviewHost(
+export async function connectReviewHost(
   ctx: Context,
   directory: string,
   identity: string,
@@ -53,9 +54,11 @@ export function connectReviewHost(
   if (signal.aborted) {
     const reason =
       signal.reason instanceof Error ? signal.reason : new Error("Reviewer host connection aborted")
-    return Promise.reject(reason)
+    throw reason
   }
-  return Promise.resolve(createInProcessReviewClient(ctx))
+  if (await registeredServiceIsSelf(version))
+    return connectV2Host(directory, identity, version, signal)
+  return createInProcessReviewClient(ctx)
 }
 
 /** Host effects are injectable without changing the plugin entry contract. */

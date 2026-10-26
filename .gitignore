@@ -40,6 +40,9 @@ coverage/
 # reference clones (e.g. codex) if placed inside the worktree
 /codex
 
+# session-local attachments and tool state
+/.opencode/
+
 # test scratch directories
 tests/.tmp-reviewer-isolated/
 __pycache__/

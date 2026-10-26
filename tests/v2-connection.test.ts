@@ -6,6 +6,7 @@ import { OpenCode, type OpenCodeClient } from "@opencode/client"
 import {
   connectV2Host,
   hostCompatibleFetch,
+  registeredServiceIsSelf,
   validateHostEndpoint,
 } from "../src/opencode/v2/connection.ts"
 
@@ -62,6 +63,30 @@ test("explicit V2 host URLs reject embedded credentials and non-loopback HTTP", 
   )
   expect(validateHostEndpoint("http://127.0.0.1:4096/").href).toBe("http://127.0.0.1:4096/")
   expect(validateHostEndpoint("https://example.invalid/").href).toBe("https://example.invalid/")
+})
+
+test("only a service registration owned by this process counts as the host", async () => {
+  const root = await mkdtemp(join(tmpdir(), "reviewer-service-"))
+  process.env[stateHome] = root
+  await mkdir(join(root, "opencode"), { recursive: true })
+  const register = (pid: number) =>
+    writeFile(
+      join(root, "opencode", "service.json"),
+      JSON.stringify({
+        version: "2.0.3",
+        url: "http://127.0.0.1:4096/",
+        pid,
+        password: "synthetic",
+      }),
+    )
+  try {
+    await register(process.pid)
+    expect(await registeredServiceIsSelf("2.0.3")).toBe(true)
+    await register(process.ppid)
+    expect(await registeredServiceIsSelf("2.0.3")).toBe(false)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test("explicit V2 host connection rejects missing authentication", async () => {
