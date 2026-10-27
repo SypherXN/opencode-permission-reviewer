@@ -1,10 +1,13 @@
 import { expect, test } from "bun:test"
-import { existsSync } from "node:fs"
-import { readFile, rm } from "node:fs/promises"
+import { existsSync, mkdtempSync } from "node:fs"
+import { readFile, copyFile, rm, stat, utimes, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { pathToFileURL } from "node:url"
 import type { OpenCodeClient } from "@opencode/client"
 import type { Plugin } from "@opencode/plugin"
 import { createV2ReviewerBackend } from "../src/opencode/v2/backend-factory.ts"
+import { createIsolatedLocation } from "../src/opencode/v2/isolated-location.ts"
 import { SYSTEM_ONE_QUESTIONS } from "../src/system-one/review.ts"
 import { DEFAULT_CONFIG } from "../src/config.ts"
 import { ReviewAttempt } from "../src/core/review-attempt.ts"
@@ -52,6 +55,9 @@ function fixture(
     pluginMcp?: boolean
   } = {},
 ) {
+  const isolationBase = mkdtempSync(join(tmpdir(), "prb-isolation-"))
+  const previousIsolationBase = process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+  process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = isolationBase
   let tool!: Tool
   let contextHook!: (event: ContextEvent) => void
   let toolHook!: (event: { sessionID: string; tool: string }) => void
@@ -60,7 +66,7 @@ function fixture(
   let requestedModel: unknown
   const rpcCalls: unknown[] = []
   const directories: string[] = []
-  const activated = new Set<string>()
+  const activated = new Set<unknown>()
   let sessionID = ""
   const sessionIDs: string[] = []
   const removed = new Set<string>()
@@ -130,14 +136,24 @@ function fixture(
       list: async (input: { location: { directory: string } }) => {
         directory = input.location.directory
         checks++
-        if (!activated.has(directory)) {
-          const plugin = await import(pathToFileURL(directory + "/index.js").href)
+        {
+          // The host re-reads a rewritten bootstrap file; a module cache would not.
+          const evaluated = join(directory, `index.${checks}.js`)
+          await copyFile(join(directory, "index.js"), evaluated)
+          const plugin = await import(pathToFileURL(evaluated).href)
           pluginID = plugin.default.id
-          scope.length = 0
-          hostCleanup = await plugin.default.setup({ ...ctx, location: { directory } })
-          activated.add(directory)
-          directories.push(directory)
-          setups++
+          // Matching bytes keep their timestamp, so a new location is a new activation.
+          const generation = (
+            globalThis as unknown as Record<symbol, Map<string, unknown> | undefined>
+          )[Symbol.for("opencode-permission-reviewer.isolated-activation")]?.get("isolation")
+          if (!generation) throw new Error("isolation activation missing")
+          if (!activated.has(generation)) {
+            scope.length = 0
+            hostCleanup = await plugin.default.setup({ ...ctx, location: { directory } })
+            activated.add(generation)
+            directories.push(directory)
+            setups++
+          }
         }
         if (options.activationFailed || (options.failFirstActivation && setups === 1))
           return {
@@ -414,6 +430,11 @@ function fixture(
       for (const attempt of attempts) attempt.close("cancelled")
       await backend.dispose()
       for (const path of directories) if (existsSync(path)) await rm(path, { recursive: true })
+      if (existsSync(isolationBase)) await rm(isolationBase, { recursive: true })
+      await rm(`${isolationBase}.owner`, { force: true })
+      if (previousIsolationBase === undefined)
+        delete process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+      else process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = previousIsolationBase
     },
   }
 }
@@ -610,12 +631,13 @@ test("a failed isolation bootstrap is retried in a new location", async () => {
     expect(harness.state().disposed).toBe(3)
     const failedDirectory = harness.state().directory
 
-    expect((await harness.run()).kind).toBe("allow")
+    const second = await harness.run()
+    expect(second.kind).toBe("allow")
     const recovered = harness.state()
     expect(recovered.setups).toBe(2)
     expect(recovered.disposed).toBe(3)
     expect(recovered.directories).toHaveLength(2)
-    expect(recovered.directory).not.toBe(failedDirectory)
+    expect(recovered.directory).toBe(failedDirectory)
     expect(existsSync(failedDirectory + "/opencode.json")).toBe(true)
   } finally {
     await harness.cleanup()
@@ -733,6 +755,7 @@ test("review sessions share one MCP-free location without mixing concurrent evid
     await harness.backend.dispose()
     expect(harness.state().disposed).toBe(3)
     expect(existsSync(state.directory + "/opencode.json")).toBe(true)
+    expect(existsSync(join(state.directory, "owner.pid"))).toBe(false)
     expect(() => harness.run()).toThrow("shutting down")
   } finally {
     await harness.cleanup()
@@ -765,15 +788,15 @@ test("a deleted isolation location is replaced only after its reviewer sessions 
     expect((await harness.run()).kind).toBe("allow")
     const state = harness.state()
     expect(state.setups).toBe(2)
-    expect(state.directory).not.toBe(original)
-    expect(state.directories).toEqual([original, state.directory])
+    expect(state.directory).toBe(original)
+    expect(state.directories).toEqual([original, original])
     const isolatedConfig = JSON.parse(await readFile(state.directory + "/opencode.json", "utf8"))
     expect(isolatedConfig.plugins).toEqual([
       "-opencode.config.mcp",
       "-quartermaster",
       state.directory,
     ])
-    expect(existsSync(original)).toBe(false)
+    expect(existsSync(original)).toBe(true)
     expect(existsSync(state.directory + "/index.js")).toBe(true)
   } finally {
     release()
@@ -866,11 +889,113 @@ test("an unconfirmed reviewer session does not block the next review", async () 
     await rm(original, { recursive: true, force: true })
     await expect(harness.run()).rejects.toThrow("cleanup could not be confirmed")
     const state = harness.state()
-    expect(state.directory).not.toBe(original)
+    expect(state.directory).toBe(original)
     expect(state.setups).toBe(2)
     expect(state.sessionIDs).toHaveLength(2)
     expect(() => harness.guard(stuck)).toThrow("Operational tools")
   } finally {
     await harness.cleanup()
+  }
+})
+
+test("a repeated isolation claim leaves trusted files and their timestamps untouched", async () => {
+  const base = mkdtempSync(join(tmpdir(), "prb-stable-"))
+  const previous = process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+  process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = base
+  const first = await createIsolatedLocation(async () => async () => {})
+  try {
+    const index = join(first.directory, "index.js")
+    const configPath = join(first.directory, "opencode.json")
+    const past = new Date(Date.now() - 60_000)
+    await utimes(index, past, past)
+    await utimes(configPath, past, past)
+    await writeFile(join(first.directory, "owner.pid"), "stale\n")
+    const indexStamp = (await stat(index)).mtimeMs
+    const configStamp = (await stat(configPath)).mtimeMs
+    first.release()
+    const second = await createIsolatedLocation(async () => async () => {})
+    try {
+      expect(second.directory).toBe(first.directory)
+      expect((await stat(index)).mtimeMs).toBe(indexStamp)
+      expect((await stat(configPath)).mtimeMs).toBe(configStamp)
+      expect(existsSync(join(first.directory, "owner.pid"))).toBe(false)
+      expect(await readFile(`${base}.owner`, "utf8")).toBe(`${process.pid}\n`)
+    } finally {
+      second.release()
+    }
+  } finally {
+    first.release()
+    if (previous === undefined) delete process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+    else process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = previous
+    await rm(base, { recursive: true, force: true })
+    await rm(`${base}.owner`, { force: true })
+  }
+})
+
+test("a live owner lock reuses the trusted directory", async () => {
+  const base = mkdtempSync(join(tmpdir(), "prb-owner-"))
+  const previous = process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+  process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = base
+  let otherAlive = false
+  try {
+    process.kill(process.ppid, 0)
+    otherAlive = true
+  } catch {
+    otherAlive = false
+  }
+  expect(otherAlive).toBe(true)
+  await writeFile(`${base}.owner`, `${process.ppid}\n`)
+  const location = await createIsolatedLocation(async () => async () => {})
+  try {
+    expect(location.directory).toBe(base)
+  } finally {
+    location.release()
+    if (previous === undefined) delete process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+    else process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = previous
+    await rm(base, { recursive: true, force: true })
+    await rm(`${base}.owner`, { force: true })
+  }
+})
+
+test("a setup that ran before activation binds without rewriting the folder", async () => {
+  const base = mkdtempSync(join(tmpdir(), "prb-early-"))
+  const previous = process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+  process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = base
+  const first = await createIsolatedLocation(async () => async () => {})
+  const directory = first.directory
+  const index = join(directory, "index.js")
+  const stamp = (await stat(index)).mtimeMs
+  first.release()
+  let second: { release(): void } | undefined
+  try {
+    const plugin = await import(pathToFileURL(index).href)
+    const ctx = {
+      location: { directory },
+      mcp: {
+        transform: async (
+          callback: (editor: { list(): []; remove(name: string): void }) => void,
+        ) => {
+          await callback({ list: () => [], remove: () => {} })
+          return async () => {}
+        },
+      },
+    }
+    await plugin.default.setup(ctx)
+    let bound = 0
+    second = await createIsolatedLocation(async () => {
+      bound += 1
+      return async () => {}
+    })
+    expect(second.directory).toBe(directory)
+    expect(bound).toBe(1)
+    expect((await stat(index)).mtimeMs).toBe(stamp)
+    await plugin.default.setup(ctx)
+    expect(bound).toBe(1)
+  } finally {
+    second?.release()
+    if (previous === undefined) delete process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+    else process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = previous
+    await rm(base, { recursive: true, force: true })
+    await rm(`${base}.owner`, { force: true })
   }
 })

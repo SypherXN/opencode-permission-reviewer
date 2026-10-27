@@ -18,6 +18,7 @@ import { enforceDecision, parseDecision, parseDecisionFromText } from "../../dec
 import { applyEscalationDisposition } from "../../escalation.ts"
 import { formatFailureReason } from "../../failure-reason.ts"
 import { DEFAULT_CONFIG, splitModel } from "../../config.ts"
+import { sameIsolationDirectory } from "./in-process-client.ts"
 import { createIsolatedLocation } from "./isolated-location.ts"
 import { selectPlanModel } from "./plan-routing.ts"
 import { captureRequestTools } from "./request-diagnostics.ts"
@@ -301,7 +302,9 @@ export class V2ReviewerBackend {
       return registration
     })
     try {
-      const signal = AbortSignal.any([this.locationAbort.signal, AbortSignal.timeout(15_000)])
+      // The plugin is active as soon as setup runs. The longer bound covers a
+      // folder-trust dialog, which blocks that load until it is answered.
+      const signal = AbortSignal.any([this.locationAbort.signal, AbortSignal.timeout(90_000)])
       await waitForIsolationActive(client, isolated.directory, isolated.pluginID, signal)
       if (registrations.size === 0) throw new Error("Reviewer isolation hooks did not activate")
       return { directory: isolated.directory, dispose, release: isolated.release }
@@ -309,6 +312,8 @@ export class V2ReviewerBackend {
       await dispose().catch(() => {})
       isolated.release()
       // The host may have cached this location, so its MCP exclusion stays on disk.
+      if (error instanceof Error && error.name === "TimeoutError")
+        throw new Error("Reviewer isolation did not activate before the deadline", { cause: error })
       throw error
     }
   }
@@ -565,8 +570,11 @@ async function waitForIsolationActive(
       const path = plugin.source.path
       if (typeof path !== "string") return false
       try {
-        const local = resolve(path.startsWith("file:") ? fileURLToPath(path) : path)
-        return local === root || local === join(root, "index.js")
+        const local = path.startsWith("file:") ? fileURLToPath(path) : path
+        return (
+          sameIsolationDirectory(local, root) ||
+          sameIsolationDirectory(local, join(root, "index.js"))
+        )
       } catch {
         return false
       }

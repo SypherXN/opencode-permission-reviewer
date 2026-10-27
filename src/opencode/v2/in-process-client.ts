@@ -30,6 +30,15 @@ function locationKey(directory: string): string {
   return process.platform === "win32" ? resolved.toLowerCase() : resolved
 }
 
+/** Windows hosts report the same folder with different slashes and drive-letter case. */
+export function sameIsolationDirectory(
+  left: string | undefined,
+  right: string | undefined,
+): boolean {
+  if (!left || !right) return false
+  return locationKey(left) === locationKey(right)
+}
+
 /** Remember the context the host passed into an isolation plugin setup. */
 export function noteIsolationContext(directory: string, ctx: IsolationQueryContext): void {
   isolationContexts.set(locationKey(directory), ctx)

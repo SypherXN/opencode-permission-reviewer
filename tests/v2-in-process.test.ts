@@ -387,6 +387,9 @@ test("explicit host URL keeps the HTTP identity check and in-process does not op
 
 async function hostFixture(options: { mcpServers?: boolean; quartermaster?: boolean } = {}) {
   const workspace = await mkdtemp(join(tmpdir(), "reviewer-in-process-"))
+  const isolationBase = await mkdtemp(join(tmpdir(), "reviewer-isolation-"))
+  const previousIsolationBase = process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+  process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = isolationBase
   const globalPath = join(workspace, "global.jsonc")
   await writeFile(
     globalPath,
@@ -656,6 +659,11 @@ async function hostFixture(options: { mcpServers?: boolean; quartermaster?: bool
       await rm(workspace, { recursive: true, force: true })
       for (const directory of created)
         if (directory !== workspace) await rm(directory, { recursive: true, force: true })
+      await rm(isolationBase, { recursive: true, force: true })
+      await rm(`${isolationBase}.owner`, { force: true })
+      if (previousIsolationBase === undefined)
+        delete process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+      else process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = previousIsolationBase
     },
   }
 }
