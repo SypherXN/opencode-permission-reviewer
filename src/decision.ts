@@ -16,6 +16,41 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
+function enumValue(value: unknown, allowed: Set<string>): unknown {
+  if (typeof value !== "string") return value
+  const normalized = value.trim().toLowerCase()
+  return allowed.has(normalized) ? normalized : value
+}
+
+/**
+ * Models often emit a valid decision with a format the tool schema rejects:
+ * a string version, capitalized enums, a quoted confidence, or a script note
+ * that is too short to keep. Those are presentation differences. Unknown
+ * fields stay in place and are ignored; a wrong version or outcome still fails.
+ */
+function normalizeDecision(value: Record<string, unknown>): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...value }
+  if (typeof next.version === "string" && next.version.trim() === "2") next.version = 2
+  next.outcome = enumValue(next.outcome, OUTCOMES)
+  next.risk_level = enumValue(next.risk_level, RISKS)
+  next.user_authorization = enumValue(next.user_authorization, AUTHORIZATIONS)
+  next.scope_alignment = enumValue(next.scope_alignment, SCOPE_ALIGNMENTS)
+  next.evidence_completeness = enumValue(next.evidence_completeness, EVIDENCE_SUFFICIENCY)
+  if (typeof next.rationale === "string") next.rationale = next.rationale.trim()
+  if (typeof next.confidence === "string" && next.confidence.trim() !== "") {
+    const confidence = Number(next.confidence)
+    if (Number.isFinite(confidence)) next.confidence = confidence
+  }
+  if (typeof next.script_analysis !== "string") {
+    delete next.script_analysis
+  } else {
+    const analysis = next.script_analysis.trim()
+    if (analysis.length < 20 || analysis.length > 1500) delete next.script_analysis
+    else next.script_analysis = analysis
+  }
+  return next
+}
+
 /**
  * Parse the reviewer's plain-text response under a strict, fail-closed policy:
  * the entire response must be exactly one JSON object, optionally wrapped in a
@@ -62,6 +97,7 @@ export function parseDecisionFromText(text: string): ReviewDecision | undefined 
 
 export function parseDecision(value: unknown): ReviewDecision | undefined {
   if (!isRecord(value)) return
+  value = normalizeDecision(value)
   // The current schema is version 2. A model output that omits the version
   // (or carries a different one) is rejected outright and routed to a human;
   // it never silently degrades to a guessed decision.

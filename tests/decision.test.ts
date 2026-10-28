@@ -275,6 +275,27 @@ describe("schema v2 fields", () => {
     expect(parseDecision({ ...decision("allow"), version: 3 })).toBeUndefined()
   })
 
+  test("parseDecision normalizes presentation differences and drops an unusable script note", () => {
+    const parsed = parseDecision({
+      ...decision("allow"),
+      version: " 2 ",
+      outcome: "Allow",
+      risk_level: "LOW",
+      confidence: "0.95",
+      rationale: "  The action is narrow, reversible, and explicitly requested.  ",
+      script_analysis: "too short",
+      commentary: "ignored",
+    })
+    expect(parsed).toMatchObject({
+      version: 2,
+      outcome: "allow",
+      risk_level: "low",
+      confidence: 0.95,
+    })
+    expect(parsed?.script_analysis).toBeUndefined()
+    expect(parsed?.rationale).toBe("The action is narrow, reversible, and explicitly requested.")
+  })
+
   test("parseDecision rejects invalid scope_alignment values", () => {
     expect(parseDecision({ ...decision("allow"), scope_alignment: "perfect" })).toBeUndefined()
   })

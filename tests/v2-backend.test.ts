@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url"
 import type { OpenCodeClient } from "@opencode/client"
 import type { Plugin } from "@opencode/plugin"
 import { createV2ReviewerBackend } from "../src/opencode/v2/backend-factory.ts"
+import { forceReviewerCompletion } from "../src/opencode/v2/reviewer-backend.ts"
 import { createIsolatedLocation } from "../src/opencode/v2/isolated-location.ts"
 import { SYSTEM_ONE_QUESTIONS } from "../src/system-one/review.ts"
 import { DEFAULT_CONFIG } from "../src/config.ts"
@@ -26,6 +27,7 @@ type ContextEvent = {
   system: unknown[]
   messages: unknown[]
   tools: Record<string, unknown>
+  options?: { maxTokens?: number }
 }
 
 function fixture(
@@ -33,6 +35,11 @@ function fixture(
     format?: ReviewerConfig["outputFormat"]
     invalid?: boolean
     ambiguous?: boolean
+    textBody?: string
+    reasoningBody?: string
+    lowBudget?: boolean
+    toolError?: unknown
+    toolErrors?: unknown[]
     foreignResponse?: boolean
     missingModel?: boolean
     noTools?: boolean
@@ -60,6 +67,7 @@ function fixture(
   process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = isolationBase
   let tool!: Tool
   let contextHook!: (event: ContextEvent) => void
+  const sessionHooks = new Map<string, (event: never) => unknown>()
   let toolHook!: (event: { sessionID: string; tool: string }) => void
   let directory = ""
   let requestedVariant: string | undefined
@@ -119,8 +127,9 @@ function fixture(
       },
     },
     session: {
-      hook: async (_name: string, callback: typeof contextHook) => {
-        contextHook = callback
+      hook: async (name: string, callback: (event: never) => unknown) => {
+        sessionHooks.set(name, callback)
+        if (name === "context") contextHook = callback as typeof contextHook
         return registration()
       },
     },
@@ -263,8 +272,36 @@ function fixture(
             execute: {},
             edit: {},
           },
+          ...(options.lowBudget ? { options: { maxTokens: 16 } } : {}),
         }
         contextHook(event)
+        if (options.lowBudget) {
+          expect(event.options?.maxTokens).toBeGreaterThanOrEqual(16384)
+          const request = new Request("https://api.openai.com/v1/responses", {
+            method: "POST",
+            headers: { "content-type": "application/json", "content-length": "4" },
+            body: JSON.stringify({
+              model: "gpt-6-luna",
+              input: [],
+              max_output_tokens: 64,
+              tools: [{ type: "function", name: "permission_reviewer_result" }],
+            }),
+          })
+          const outgoing = {
+            sessionID: current,
+            kind: "primary",
+            model: {},
+            request,
+          }
+          await sessionHooks.get("http.request")?.(outgoing as never)
+          const sent = JSON.parse(await outgoing.request.clone().text())
+          expect(sent.max_output_tokens).toBeGreaterThanOrEqual(16384)
+          expect(sent.tool_choice).toEqual({
+            type: "function",
+            name: "permission_reviewer_result",
+          })
+          expect(outgoing.request.headers.get("content-length")).toBeNull()
+        }
         messagesBySession.set(current, JSON.stringify(event.messages))
         expect(JSON.stringify(event.system)).not.toContain("UNTRUSTED_SYSTEM")
         expect(JSON.stringify(event.messages)).not.toContain("UNTRUSTED_HISTORY")
@@ -288,7 +325,14 @@ function fixture(
         }
         expect(() => toolHook({ sessionID: current, tool: "shell" })).toThrow("Operational tools")
         expect(() => toolHook({ sessionID: current, tool: "execute" })).toThrow("Operational tools")
-        if (options.format !== "text" && !options.invalid) {
+        if (
+          options.format !== "text" &&
+          !options.invalid &&
+          options.textBody === undefined &&
+          options.reasoningBody === undefined &&
+          options.toolError === undefined &&
+          options.toolErrors === undefined
+        ) {
           await tool.execute(tool.input.parse(decision("allow")), { sessionID: current })
           if (options.ambiguous)
             await expect(tool.execute(decision("deny"), { sessionID: current })).rejects.toThrow(
@@ -308,21 +352,59 @@ function fixture(
           type: "assistant",
           id: "message_result",
           content:
-            options.format === "text"
+            options.reasoningBody !== undefined &&
+            options.textBody === undefined &&
+            options.toolError === undefined &&
+            options.toolErrors === undefined
+              ? [{ type: "reasoning", text: options.reasoningBody }]
+              : options.textBody !== undefined
               ? [
-                  {
-                    type: "text",
-                    text: options.invalid ? "not a decision" : JSON.stringify(decision("allow")),
-                  },
+                  ...(options.reasoningBody !== undefined
+                    ? [{ type: "reasoning", text: options.reasoningBody }]
+                    : []),
+                  { type: "text", text: options.textBody },
                 ]
-              : [
-                  {
+              : options.toolErrors !== undefined
+                ? options.toolErrors.map((input, index) => ({
                     type: "tool",
-                    id: "call_result",
+                    id: `call_${index}`,
                     name: "permission_reviewer_result",
-                    state: { status: "completed" },
-                  },
-                ],
+                    state: {
+                      status: "error",
+                      input,
+                      error: { type: "validation", message: "Invalid" },
+                    },
+                  }))
+                : options.toolError !== undefined
+                  ? [
+                      {
+                        type: "tool",
+                        id: "call_result",
+                        name: "permission_reviewer_result",
+                        state: {
+                          status: "error",
+                          input: options.toolError,
+                          error: { type: "validation", message: "Invalid" },
+                        },
+                      },
+                    ]
+                  : options.format === "text"
+                    ? [
+                        {
+                          type: "text",
+                          text: options.invalid
+                            ? "not a decision"
+                            : JSON.stringify(decision("allow")),
+                        },
+                      ]
+                    : [
+                        {
+                          type: "tool",
+                          id: "call_result",
+                          name: "permission_reviewer_result",
+                          state: { status: "completed" },
+                        },
+                      ],
         },
       ],
       interrupt: async () => {},
@@ -582,6 +664,109 @@ test("Jev reasoning escalation uses its configured model without agent routing",
   }
 })
 
+test("a short provider budget is raised and the decision tool is required", () => {
+  expect(
+    forceReviewerCompletion({
+      input: [],
+      max_output_tokens: 64,
+      tools: [{ type: "function", name: "permission_reviewer_result" }],
+    }),
+  ).toMatchObject({
+    max_output_tokens: 16384,
+    tool_choice: { type: "function", name: "permission_reviewer_result" },
+  })
+  expect(
+    forceReviewerCompletion({
+      messages: [],
+      max_tokens: 32,
+      tools: [{ type: "function", function: { name: "permission_reviewer_result" } }],
+    }),
+  ).toMatchObject({
+    max_tokens: 16384,
+    tool_choice: { type: "function", function: { name: "permission_reviewer_result" } },
+  })
+  expect(
+    forceReviewerCompletion({
+      messages: [],
+      tools: [{ type: "function", function: { name: "shell" } }],
+    }),
+  ).toBeUndefined()
+})
+
+test("a reasoning model can leave the only decision in reasoning, and a short budget is raised", async () => {
+  const reasoning = fixture({ reasoningBody: JSON.stringify(decision("allow")) })
+  try {
+    const result = await reasoning.run()
+    expect(result.kind).toBe("allow")
+    expect(reasoning.state().prompts).toBe(1)
+  } finally {
+    await reasoning.cleanup()
+  }
+  const buried = fixture({
+    reasoningBody: JSON.stringify(decision("allow")),
+    textBody: `The decision is:\n${JSON.stringify(decision("allow"))}`,
+  })
+  try {
+    expect((await buried.run()).kind).toBe("escalate")
+    expect(buried.state().prompts).toBe(3)
+  } finally {
+    await buried.cleanup()
+  }
+  const budget = fixture({ lowBudget: true })
+  try {
+    expect((await budget.run()).kind).toBe("allow")
+  } finally {
+    await budget.cleanup()
+  }
+})
+
+test("a structured reviewer accepts one normalized decision from text or a rejected tool call", async () => {
+  const loose = {
+    ...decision("allow"),
+    version: "2",
+    outcome: "Allow",
+    confidence: "0.95",
+    script_analysis: "too short",
+    commentary: "ignored",
+  }
+  const text = fixture({ textBody: JSON.stringify(loose) })
+  try {
+    const result = await text.run()
+    expect(result.kind).toBe("allow")
+    expect(result.decision?.script_analysis).toBeUndefined()
+    expect(text.state().prompts).toBe(1)
+  } finally {
+    await text.cleanup()
+  }
+  const rejected = fixture({ toolError: loose })
+  try {
+    const result = await rejected.run()
+    expect(result.kind).toBe("allow")
+    expect(result.decision?.version).toBe(2)
+    expect(rejected.state().prompts).toBe(1)
+  } finally {
+    await rejected.cleanup()
+  }
+  const prose = fixture({
+    textBody: `The decision is:\n${JSON.stringify(decision("allow"))}`,
+  })
+  try {
+    expect((await prose.run()).kind).toBe("escalate")
+    expect(prose.state().prompts).toBe(3)
+  } finally {
+    await prose.cleanup()
+  }
+  const conflict = fixture({
+    toolErrors: [decision("allow"), decision("deny")],
+  })
+  try {
+    expect((await conflict.run()).kind).toBe("escalate")
+    expect(conflict.state().prompts).toBe(1)
+  } finally {
+    await conflict.cleanup()
+  }
+})
+
 test("invalid, ambiguous, and foreign execution outputs never become approvals", async () => {
   for (const options of [
     { invalid: true },
@@ -628,14 +813,14 @@ test("a failed isolation bootstrap is retried in a new location", async () => {
     expect(first.kind).toBe("escalate")
     expect(first.reason).toContain("failed to activate")
     expect(harness.state().directories).toHaveLength(1)
-    expect(harness.state().disposed).toBe(3)
+    expect(harness.state().disposed).toBe(4)
     const failedDirectory = harness.state().directory
 
     const second = await harness.run()
     expect(second.kind).toBe("allow")
     const recovered = harness.state()
     expect(recovered.setups).toBe(2)
-    expect(recovered.disposed).toBe(3)
+    expect(recovered.disposed).toBe(4)
     expect(recovered.directories).toHaveLength(2)
     expect(recovered.directory).toBe(failedDirectory)
     expect(existsSync(failedDirectory + "/opencode.json")).toBe(true)
@@ -649,10 +834,10 @@ test("backend disposal releases hooks registered by a later location activation"
   try {
     expect((await harness.run()).kind).toBe("allow")
     await harness.reload()
-    expect(harness.state().disposed).toBe(3)
+    expect(harness.state().disposed).toBe(4)
     expect((await harness.run()).kind).toBe("allow")
     await harness.backend.dispose()
-    expect(harness.state().disposed).toBe(6)
+    expect(harness.state().disposed).toBe(8)
     expect(existsSync(harness.state().directory + "/opencode.json")).toBe(true)
   } finally {
     await harness.cleanup()
@@ -753,7 +938,7 @@ test("review sessions share one MCP-free location without mixing concurrent evid
     expect(harness.state().directory).toBe(state.directory)
     expect(harness.state().setups).toBe(1)
     await harness.backend.dispose()
-    expect(harness.state().disposed).toBe(3)
+    expect(harness.state().disposed).toBe(4)
     expect(existsSync(state.directory + "/opencode.json")).toBe(true)
     expect(existsSync(join(state.directory, "owner.pid"))).toBe(false)
     expect(() => harness.run()).toThrow("shutting down")

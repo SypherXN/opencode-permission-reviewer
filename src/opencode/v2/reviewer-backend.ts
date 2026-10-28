@@ -25,6 +25,43 @@ import { captureRequestTools } from "./request-diagnostics.ts"
 
 type Context = Parameters<Plugin.Plugin["setup"]>[0]
 const TOOL = "permission_reviewer_result"
+/** Floor for one decision after a reasoning model spends tokens on the trace. */
+const COMPLETION_BUDGET = 16_384
+
+function toolName(tool: unknown): string | undefined {
+  if (typeof tool !== "object" || tool === null) return
+  const record = tool as Record<string, unknown>
+  if (typeof record.name === "string") return record.name
+  const fn = record.function
+  if (typeof fn === "object" && fn !== null && typeof (fn as Record<string, unknown>).name === "string")
+    return (fn as Record<string, unknown>).name as string
+}
+
+/** Raise a short output cap and require the decision tool on the provider body. */
+export function forceReviewerCompletion(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return
+  const body = { ...(value as Record<string, unknown>) }
+  const tools = body.tools
+  if (!Array.isArray(tools)) return
+  if (!tools.some((tool) => toolName(tool) === TOOL)) return
+  const chat = tools.some(
+    (tool) => typeof tool === "object" && tool !== null && "function" in tool,
+  )
+  const raise = (key: string) => {
+    const current = body[key]
+    if (typeof current === "number" && Number.isFinite(current) && current >= COMPLETION_BUDGET) return
+    body[key] = COMPLETION_BUDGET
+  }
+  if (chat) {
+    if ("max_tokens" in body && !("max_completion_tokens" in body)) raise("max_tokens")
+    else raise("max_completion_tokens")
+    body.tool_choice = { type: "function", function: { name: TOOL } }
+  } else {
+    raise("max_output_tokens")
+    body.tool_choice = { type: "function", name: TOOL }
+  }
+  return body
+}
 const resultSchema = z
   .object({
     version: z.literal(2),
@@ -35,7 +72,6 @@ const resultSchema = z
     evidence_completeness: z.enum(["sufficient", "partial", "insufficient", "unknown"]),
     rationale: z.string().min(3).max(2000),
     confidence: z.number().min(0).max(1),
-    script_analysis: z.string().min(20).max(1500).optional(),
   })
   .strict()
 
@@ -70,6 +106,46 @@ function errorMark(error: unknown): string {
 
 function sessionNotFoundTag(tag: unknown): boolean {
   return tag === "SessionNotFoundError" || tag === "Session.NotFoundError"
+}
+
+function sameDecision(left: ReviewDecision, right: ReviewDecision): boolean {
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
+/**
+ * A tool call can fail schema validation before execute() stores it. The raw
+ * arguments are still the model's decision. Accept them only when every call
+ * is this tool and every call normalizes to the same decision.
+ */
+function toolArguments(input: unknown): unknown {
+  if (typeof input !== "string") return input
+  try {
+    return JSON.parse(input)
+  } catch {
+    return
+  }
+}
+
+function recoveredToolDecision(
+  parts: ReadonlyArray<{ name?: string; state?: { status?: string; input?: unknown } }>,
+): ReviewDecision | "ambiguous" | undefined {
+  if (parts.length === 0) return
+  if (parts.length > 3) return "ambiguous"
+  const decisions: ReviewDecision[] = []
+  for (const part of parts) {
+    if (part.name !== TOOL) return "ambiguous"
+    const status = part.state?.status
+    // A finished review can still be "streaming" when the provider closed the
+    // turn before the host marked the tool completed. The arguments are the decision.
+    if (status !== "error" && status !== "completed" && status !== "streaming") return
+    const decision = parseDecision(toolArguments(part.state?.input))
+    if (!decision) return
+    decisions.push(decision)
+  }
+  const first = decisions[0]
+  if (!first) return
+  if (decisions.some((item) => !sameDecision(item, first))) return "ambiguous"
+  return first
 }
 
 function sessionGone(error: unknown): boolean {
@@ -154,16 +230,53 @@ export class V2ReviewerBackend {
               text:
                 REVIEWER_SYSTEM_PROMPT +
                 (pending.structured
-                  ? `\nReturn the decision using ${TOOL} exactly once, then stop.`
-                  : ""),
+                  ? `\nCall ${TOOL} exactly once with one version-2 decision, then stop. That is the only tool you may use. Put the decision in the tool call, not in reasoning.`
+                  : "")
             },
           ]
+          // Reasoning models spend the completion budget before the decision.
+          // A short cap returns a few tokens and no tool call.
+          if (!event.options) event.options = {}
+          if (
+            typeof event.options.maxTokens !== "number" ||
+            !Number.isFinite(event.options.maxTokens) ||
+            event.options.maxTokens < COMPLETION_BUDGET
+          )
+            event.options.maxTokens = COMPLETION_BUDGET
           event.messages = [{ role: "user", content: [{ type: "text", text: pending.prompt }] }]
           const definition = event.tools[TOOL]
           event.tools =
             pending.structured && pending.results.length === 0 && definition
               ? { [TOOL]: definition }
               : {}
+        }),
+      )
+      registrations.push(
+        await ctx.session.hook("http.request", async (event) => {
+          const pending = this.sessions.get(event.sessionID)
+          if (
+            event.kind !== "primary" ||
+            this.retained.has(event.sessionID) ||
+            !pending?.attempt.active() ||
+            pending.closing ||
+            !pending.structured
+          )
+            return
+          let parsed: unknown
+          try {
+            parsed = JSON.parse(await event.request.clone().text())
+          } catch {
+            return
+          }
+          const body = forceReviewerCompletion(parsed)
+          if (!body) return
+          const headers = new Headers(event.request.headers)
+          headers.delete("content-length")
+          event.request = new Request(event.request.url, {
+            method: event.request.method,
+            headers,
+            body: JSON.stringify(body),
+          })
         }),
       )
       if (this.config.debug) {
@@ -421,24 +534,44 @@ export class V2ReviewerBackend {
           toolParts
             .slice(0, -1)
             .every((part) => part.name === TOOL && part.state.status === "error")
+        const text = response
+          .flatMap((message) =>
+            message.content.filter((part) => part.type === "text").map((part) => part.text),
+          )
+          .join("\n")
+        const reasoning = response
+          .flatMap((message) =>
+            message.content.filter((part) => part.type === "reasoning").map((part) => part.text),
+          )
+          .join("\n")
+        const recovered = pending.structured ? recoveredToolDecision(toolParts) : undefined
         const ambiguous =
           pending.results.length > 1 ||
+          recovered === "ambiguous" ||
           (pending.results.length === 1 &&
             (userIndex < 0 ||
               !boundedSchemaRetries ||
               finalTool?.name !== TOOL ||
               finalTool?.state.status !== "completed"))
-        const parsed = pending.structured
-          ? pending.results.length === 1 && !ambiguous
-            ? pending.results[0]
-            : undefined
-          : parseDecisionFromText(
-              response
-                .flatMap((message) =>
-                  message.content.filter((part) => part.type === "text").map((part) => part.text),
-                )
-                .join("\n"),
-            )
+        // A schema rejection still carries the model's arguments. One agreement
+        // across those calls is the decision. Text is only read when the model
+        // did not call the tool, and only as one complete JSON object.
+        let parsed: ReviewDecision | undefined
+        if (!pending.structured) parsed = parseDecisionFromText(text)
+        else if (!ambiguous && pending.results.length === 1) parsed = pending.results[0]
+        else if (!ambiguous && pending.results.length === 0 && recovered !== "ambiguous") {
+          parsed =
+            recovered ?? (toolParts.length === 0 ? parseDecisionFromText(text) : undefined)
+        }
+        // A reasoning model can park the only complete decision in the reasoning
+        // channel and emit no answer. Use it only when the visible reply is empty.
+        if (
+          !parsed &&
+          !ambiguous &&
+          toolParts.length === 0 &&
+          text.trim().length === 0
+        )
+          parsed = parseDecisionFromText(reasoning)
         if (ambiguous) break
         if (parsed)
           return {
@@ -447,8 +580,9 @@ export class V2ReviewerBackend {
             decisionSource: "llm-reviewer",
             reviewerModel: `${providerID}/${modelID}`,
           }
-        pending.prompt +=
-          "\nThe prior response was invalid. Return exactly one valid decision using the requested format."
+        pending.prompt += pending.structured
+          ? "\nThe prior response was invalid. Call permission_reviewer_result exactly once with version set to the number 2 and only the required decision fields. Do not answer with prose."
+          : "\nThe prior response was invalid. Return exactly one valid decision using the requested format."
       }
       return applyEscalationDisposition(
         {
