@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { execFile as execFileCallback, spawn } from "node:child_process"
 import {
   chmod,
+  link,
   mkdir,
   mkdtemp,
   open,
@@ -14,7 +15,8 @@ import {
 import { readFileSync, writeFileSync, openSync, writeSync, closeSync } from "node:fs"
 import { join, dirname } from "node:path"
 import { tmpdir } from "node:os"
-import { createAuditWriter, DEFAULT_AUDIT_PATH, readAuditSummary } from "../src/audit.ts"
+import { pathToFileURL } from "node:url"
+import { createAuditWriter, DEFAULT_AUDIT_PATH, pruneExpiredAudit, readAuditSummary } from "../src/audit.ts"
 import { DEFAULT_CONFIG } from "../src/config.ts"
 import type { ReviewAuditRecord } from "../src/types.ts"
 
@@ -46,6 +48,61 @@ function writeAt(fd: number, data: string, position: number): void {
     const count = writeSync(fd, buffer, written, buffer.length - written, position + written)
     if (count === 0) throw new Error("short write while building sparse fixture")
     written += count
+  }
+}
+
+/** Node 22.18+ and 23.6+ run TypeScript sources directly; older Node cannot load them. */
+function nodeWithTypeStripping(): string | undefined {
+  const node = Bun.which("node")
+  if (!node) return
+  const [major = 0, minor = 0] = Bun.spawnSync([node, "--version"])
+    .stdout.toString()
+    .trim()
+    .slice(1)
+    .split(".")
+    .map(Number)
+  return major > 23 || (major === 23 && minor >= 6) || (major === 22 && minor >= 18) ? node : undefined
+}
+const node = nodeWithTypeStripping()
+
+/** Real child processes, with bounded waits and output retained for failures. */
+function auditChild(source: string, command: string[] = [process.execPath]) {
+  const [executable = process.execPath, ...args] = command
+  const child = spawn(executable, [...args, "-e", source], { stdio: ["ignore", "pipe", "pipe"] })
+  let output = ""
+  let errors = ""
+  child.stdout.on("data", (chunk) => (output += chunk))
+  child.stderr.on("data", (chunk) => (errors += chunk))
+  const done = new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL")
+      reject(new Error(`audit child timed out: ${output}\n${errors}`))
+    }, 10_000)
+    child.on("error", (error) => {
+      clearTimeout(timer)
+      reject(error)
+    })
+    child.on("close", (code) => {
+      clearTimeout(timer)
+      if (code === 0) resolve()
+      else reject(new Error(`audit child exited ${code}: ${output}\n${errors}`))
+    })
+  })
+  void done.catch(() => {})
+  return {
+    done,
+    output: () => output,
+    async waitFor(text: string) {
+      const deadline = Date.now() + 5_000
+      while (!output.includes(text)) {
+        if (Date.now() > deadline) throw new Error(`missing ${text}: ${output}\n${errors}`)
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+    },
+    async stop() {
+      child.kill("SIGKILL")
+      await done.catch(() => {})
+    },
   }
 }
 
@@ -186,6 +243,32 @@ describe("audit writer", () => {
     expect(logs.length).toBeGreaterThan(0)
   })
 
+  test("unsafe lock paths are refused without touching the audit log or link target", async () => {
+    for (const kind of ["directory", "symlink", "hardlink"]) {
+      const auditPath = join(directory, `${kind}.jsonl`)
+      const lockPath = `${auditPath}.lock.sqlite`
+      const target = join(directory, `${kind}-target`)
+      const body = `${JSON.stringify(record({
+        timestamp: new Date(Date.now() - 26 * 60 * 60 * 1000).toISOString(),
+      }))}\n`
+      await writeFile(auditPath, body)
+      await writeFile(target, "keep-me")
+      if (kind === "directory") await mkdir(lockPath)
+      else if (kind === "symlink") await symlink(target, lockPath)
+      else await link(target, lockPath)
+      const logs: unknown[] = []
+      const writer = createAuditWriter(
+        { ...DEFAULT_CONFIG, audit: true, auditPath },
+        (_message, details) => logs.push(details),
+      )!
+      await expect(writer(record())).resolves.toBeUndefined()
+      expect(() => pruneExpiredAudit(auditPath)).toThrow("not a regular")
+      expect(logs).toHaveLength(1)
+      expect(await readFile(auditPath, "utf8")).toBe(body)
+      expect(await readFile(target, "utf8")).toBe("keep-me")
+    }
+  })
+
   test("a readerless FIFO audit path fails fast instead of blocking the writer", async () => {
     // The dangerous shape is a FIFO at the audit path with no reader: a
     // blocking write-open would hang the host forever before the
@@ -296,12 +379,226 @@ console.log("DONE")`,
     expect(ids).toEqual(["per_1", "per_2", "per_3"])
   })
 
+  test("pruning preserves another process's append and releases locks after a crash", async () => {
+    for (const crash of [false, true]) {
+      const auditPath = join(directory, `concurrent-${crash}.jsonl`)
+      const gate = join(directory, `resume-${crash}`)
+      const older = new Date(Date.now() - 26 * 60 * 60 * 1000).toISOString()
+      await writeFile(auditPath, `${JSON.stringify(record({ requestID: "expired", timestamp: older }))}\n`)
+      const setup = `
+const { createAuditWriter } = await import(${JSON.stringify(join(repoRoot, "src/audit.ts"))});
+const { DEFAULT_CONFIG } = await import(${JSON.stringify(join(repoRoot, "src/config.ts"))});
+const writer = createAuditWriter({ ...DEFAULT_CONFIG, audit: true, auditPath: ${JSON.stringify(auditPath)} },
+  (message, details) => {
+    if (message.startsWith("failed")) { console.error(message, details); process.exitCode = 1 }
+  });`
+      const pruning = auditChild(`
+import { mock } from "bun:test";
+import * as fs from "node:fs";
+const rename = fs.renameSync;
+mock.module("node:fs", () => ({ ...fs, renameSync(from, to) {
+  if (to === ${JSON.stringify(auditPath)}) {
+    console.log("PRUNING");
+    const deadline = Date.now() + 8000;
+    const wait = new Int32Array(new SharedArrayBuffer(4));
+    while (!fs.existsSync(${JSON.stringify(gate)})) {
+      if (Date.now() > deadline) throw new Error("pruning gate timed out");
+      Atomics.wait(wait, 0, 0, 10);
+    }
+  }
+  return rename(from, to);
+} }));
+${setup}
+await writer(${JSON.stringify(record({ requestID: "pruner" }))});
+console.log("DONE");`)
+      let appending: ReturnType<typeof auditChild> | undefined
+      try {
+        await pruning.waitFor("PRUNING")
+        appending = auditChild(`${setup}
+console.log("WRITING");
+await writer(${JSON.stringify(record({ requestID: "other-process" }))});
+console.log("DONE");`)
+        await appending.waitFor("WRITING")
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        const waitedForPruner = !appending.output().includes("DONE")
+        if (crash) await pruning.stop()
+        else await writeFile(gate, "resume")
+        await appending.done
+        if (!crash) await pruning.done
+        const ids = (await readFile(auditPath, "utf8")).trim().split("\n")
+          .map((line) => (JSON.parse(line) as ReviewAuditRecord).requestID)
+        expect(ids).toEqual(crash ? ["other-process"] : ["pruner", "other-process"])
+        expect(waitedForPruner).toBe(true)
+      } finally {
+        await writeFile(gate, "resume")
+        await pruning.stop()
+        await appending?.stop()
+      }
+    }
+  }, 30_000)
+
+  test("independent writers and processes keep every record during a burst", async () => {
+    const auditPath = join(directory, "burst.jsonl")
+    const gate = join(directory, "start-burst")
+    await writeFile(auditPath, `${JSON.stringify(record({
+      requestID: "expired",
+      timestamp: new Date(Date.now() - 26 * 60 * 60 * 1000).toISOString(),
+    }))}\n`)
+    const children = Array.from({ length: 4 }, (_, index) => auditChild(`
+import { existsSync } from "node:fs";
+const { createAuditWriter } = await import(${JSON.stringify(join(repoRoot, "src/audit.ts"))});
+const { DEFAULT_CONFIG } = await import(${JSON.stringify(join(repoRoot, "src/config.ts"))});
+const writer = createAuditWriter({ ...DEFAULT_CONFIG, audit: true, auditPath: ${JSON.stringify(auditPath)} },
+  (message, details) => {
+    if (message.startsWith("failed")) { console.error(message, details); process.exitCode = 1 }
+  });
+console.log("READY");
+while (!existsSync(${JSON.stringify(gate)})) await Bun.sleep(5);
+for (let i = 0; i < 12; i++) {
+  await writer({ ...${JSON.stringify(record())}, requestID: "child-${index}-" + i });
+}`))
+    try {
+      await Promise.all(children.map((child) => child.waitFor("READY")))
+      const local = Array.from({ length: 4 }, (_, index) => {
+        const writer = createAuditWriter({ ...DEFAULT_CONFIG, audit: true, auditPath })!
+        return Promise.all(Array.from({ length: 12 }, (_, i) =>
+          writer(record({ requestID: `local-${index}-${i}` })),
+        ))
+      })
+      await writeFile(gate, "start")
+      await Promise.all([...local, ...children.map((child) => child.done)])
+      const ids = (await readFile(auditPath, "utf8")).trim().split("\n")
+        .map((line) => (JSON.parse(line) as ReviewAuditRecord).requestID)
+      const expected = ["child", "local"].flatMap((kind) =>
+        Array.from({ length: 4 }, (_, index) =>
+          Array.from({ length: 12 }, (_, i) => `${kind}-${index}-${i}`),
+        ).flat(),
+      )
+      expect(ids.sort()).toEqual(expected.sort())
+    } finally {
+      await writeFile(gate, "start")
+      await Promise.all(children.map((child) => child.stop()))
+    }
+  }, 20_000)
+
+  test.skipIf(!node)("a runtime without bun:sqlite still loads the module and loses only the record", async () => {
+    const auditPath = join(directory, "no-sqlite.jsonl")
+    const child = auditChild(
+      `
+const { createAuditWriter } = await import(${JSON.stringify(pathToFileURL(join(repoRoot, "src/audit.ts")).href)});
+const logs = [];
+const writer = createAuditWriter({ audit: true, auditPath: ${JSON.stringify(auditPath)} },
+  (message, details) => logs.push({ message, error: details?.error }));
+await writer(${JSON.stringify(record())});
+console.log(JSON.stringify(logs));`,
+      [node!, "--input-type=module"],
+    )
+    await child.done
+    expect(JSON.parse(child.output())).toEqual([
+      { message: "failed to append audit record", error: expect.stringContaining("bun:sqlite") },
+    ])
+    await expect(stat(auditPath)).rejects.toThrow()
+  })
+
   test("absolute non-tilde path is resolved", async () => {
     const auditPath = join(directory, "explicit.jsonl")
     const writeAudit = createAuditWriter({ ...DEFAULT_CONFIG, audit: true, auditPath })!
     await writeAudit(record({ requestID: "per_x" }))
     const parsed = JSON.parse((await readFile(auditPath, "utf8")).trim()) as ReviewAuditRecord
     expect(parsed.requestID).toBe("per_x")
+  })
+
+  test("drops records older than 24 hours and keeps the recent ones", async () => {
+    const auditPath = join(directory, "audit.jsonl")
+    const hour = 60 * 60 * 1000
+    // The oldest record must be an hour past retention before anything is rewritten.
+    const older = new Date(Date.now() - 25 * hour - 60_000).toISOString()
+    const expired = new Date(Date.now() - 24 * hour - 60_000).toISOString()
+    const newer = new Date(Date.now() - 24 * hour + 60_000).toISOString()
+    const lines = [
+      JSON.stringify(record({ requestID: "per_old", timestamp: older })),
+      JSON.stringify(record({ requestID: "per_old_in_slack", timestamp: expired })),
+      "not json",
+      JSON.stringify({ requestID: "per_undated", outcome: "allow" }),
+      JSON.stringify(record({ requestID: "per_kept", timestamp: newer })),
+    ]
+    // A few hundred KiB crosses the rewrite's read chunks, including a line
+    // that does not end on a chunk boundary.
+    for (let index = 0; index < 800; index++) {
+      lines.push(
+        JSON.stringify(
+          record({ requestID: `per_old_${index}`, timestamp: older, reason: "x".repeat(80) }),
+        ),
+      )
+    }
+    await writeFile(auditPath, `${lines.join("\n")}\n`)
+    const writeAudit = createAuditWriter({ ...DEFAULT_CONFIG, audit: true, auditPath })!
+    await writeAudit(record({ requestID: "per_new" }))
+    const kept = (await readFile(auditPath, "utf8")).trim().split("\n")
+    const ids = kept.map((line) => {
+      try {
+        return (JSON.parse(line) as { requestID?: string }).requestID ?? line
+      } catch {
+        return line
+      }
+    })
+    expect(ids).toContain("per_kept")
+    expect(ids).toContain("per_undated")
+    expect(ids).toContain("not json")
+    expect(ids).toContain("per_new")
+    expect(ids.some((id) => id === "per_old" || id.startsWith("per_old_"))).toBe(false)
+    await expect(stat(`${auditPath}.${process.pid}.tmp`)).rejects.toThrow()
+  })
+
+  test("no rewrite starts before the oldest record is an hour past retention", async () => {
+    const auditPath = join(directory, "audit.jsonl")
+    const hour = 60 * 60 * 1000
+    const at = (age: number) =>
+      JSON.stringify(
+        record({ requestID: `per_${age}`, timestamp: new Date(Date.now() - age).toISOString() }),
+      )
+    // A rewrite opens this temp path, and a directory there makes that open throw.
+    await mkdir(`${auditPath}.${process.pid}.tmp`)
+    for (const head of [
+      [at(24 * hour + 60_000)],
+      // Undated lines survive a rewrite, so they must not trigger one either.
+      ["not json", "", JSON.stringify({ requestID: "per_undated" }), at(hour)],
+    ]) {
+      await writeFile(auditPath, `${[...head, at(60_000)].join("\n")}\n`)
+      expect(pruneExpiredAudit(auditPath)).toBe(0)
+    }
+    await writeFile(auditPath, `${[at(25 * hour + 60_000), at(60_000)].join("\n")}\n`)
+    expect(() => pruneExpiredAudit(auditPath)).toThrow("not a regular file")
+  })
+
+  test("a symlinked audit file is not pruned through the link", async () => {
+    const target = join(directory, "target.jsonl")
+    const older = new Date(Date.now() - 26 * 60 * 60 * 1000).toISOString()
+    await writeFile(target, `${JSON.stringify(record({ requestID: "per_old", timestamp: older }))}\n`)
+    const link = join(directory, "audit.jsonl")
+    await symlink(target, link)
+    expect(pruneExpiredAudit(link)).toBe(0)
+    expect(await readFile(target, "utf8")).toContain("per_old")
+  })
+
+  test("a symlinked rewrite temp is not followed", async () => {
+    const auditPath = join(directory, "audit.jsonl")
+    const secret = join(directory, "secret.jsonl")
+    await writeFile(secret, "keep-me")
+    await symlink(secret, `${auditPath}.${process.pid}.tmp`)
+    const older = new Date(Date.now() - 26 * 60 * 60 * 1000).toISOString()
+    await writeFile(auditPath, `${JSON.stringify(record({ requestID: "per_old", timestamp: older }))}\n`)
+    const logs: unknown[] = []
+    const writeAudit = createAuditWriter(
+      { ...DEFAULT_CONFIG, audit: true, auditPath },
+      (_message, details) => logs.push(details),
+    )!
+    await writeAudit(record({ requestID: "per_new" }))
+    expect(await readFile(secret, "utf8")).toBe("keep-me")
+    const body = await readFile(auditPath, "utf8")
+    expect(body).toContain("per_old")
+    expect(body).toContain("per_new")
+    expect(logs.length).toBeGreaterThan(0)
   })
 })
 

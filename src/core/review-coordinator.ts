@@ -26,6 +26,7 @@ import { applyEscalationDisposition } from "../escalation.ts"
 import { formatFailureReason } from "../failure-reason.ts"
 import packageInfo from "../../package.json"
 import { ScriptAnalysisRegistry } from "../verified-ssh-script.ts"
+import type { DirectUsageSender } from "../system-one/direct-usage.ts"
 
 type Logger = (message: string, details?: unknown) => void
 
@@ -79,10 +80,11 @@ export class ReviewCoordinator {
     logger?: Logger,
     providers?: EvidenceProvider[],
     askDecisions?: AskDecisionSource,
+    usage?: DirectUsageSender,
   ) {
     this.log = logger ?? (() => {})
     this.backend = createV1ReviewerBackend(ctx, config, this.log, (envelope, ms) =>
-      this.recordReviewerMs(envelope, ms),
+      this.recordReviewerMs(envelope, ms), usage,
     )
     this.providers = providers ?? defaultEvidenceProviders()
     this.askDecisions = askDecisions

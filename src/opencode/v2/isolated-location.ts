@@ -4,6 +4,7 @@ import type { Plugin } from "@opencode/plugin"
 import { expandHome } from "../../audit.ts"
 import {
   forgetIsolationContext,
+  locationKey,
   noteIsolationContext,
   sameIsolationDirectory,
 } from "./in-process-client.ts"
@@ -15,6 +16,46 @@ const symbol = Symbol.for(KEY)
 const globals = globalThis as typeof globalThis & { [symbol]: Map<string, Activate> | undefined }
 const activations = globals[symbol] ?? new Map<string, Activate>()
 globals[symbol] = activations
+const MEMBERS_KEY = "opencode-permission-reviewer.isolated-members"
+const membersSymbol = Symbol.for(MEMBERS_KEY)
+const memberGlobals = globalThis as typeof globalThis & {
+  [membersSymbol]: Map<Activate, string> | undefined
+}
+/** Each live claim's activation and folder. Every project's backend claims the same folder. */
+const members = memberGlobals[membersSymbol] ?? new Map<Activate, string>()
+memberGlobals[membersSymbol] = members
+
+const preparationSymbol = Symbol.for("opencode-permission-reviewer.isolated-preparations")
+const preparationGlobals = globalThis as typeof globalThis & {
+  [preparationSymbol]: Map<string, Promise<void>> | undefined
+}
+// Share only file preparation across plugin instances, never hook activation or reviews.
+const preparations = preparationGlobals[preparationSymbol] ?? new Map<string, Promise<void>>()
+preparationGlobals[preparationSymbol] = preparations
+
+/**
+ * The host sets up a new instance of the folder after a reload. Each live
+ * backend needs its hooks on that instance, not only the one that claimed the
+ * folder last, or its reviews run without the decision tool.
+ */
+async function activateAll(ctx: Context): Promise<() => Promise<void>> {
+  const claims = [...members]
+    .filter(([, directory]) => sameIsolationDirectory(ctx.location.directory, directory))
+    .map(([activate]) => activate)
+  const results = await Promise.allSettled(claims.map((activate) => activate(ctx)))
+  const cleanups = results.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []))
+  const dispose = async () => {
+    const settled = await Promise.allSettled(cleanups.map((cleanup) => cleanup()))
+    const failed = settled.find((result) => result.status === "rejected")
+    if (failed) throw failed.reason
+  }
+  const failed = results.find((result) => result.status === "rejected")
+  if (failed) {
+    await dispose().catch(() => {})
+    throw failed.reason
+  }
+  return dispose
+}
 
 /**
  * A host asks once per folder whether to run its code and answers again only
@@ -108,32 +149,45 @@ async function bindPublishedContext(directory: string, activation: Activate): Pr
 export async function createIsolatedLocation(
   activate: Activate,
 ): Promise<{ directory: string; pluginID: string; release(): void }> {
-  const directory = await claim(
-    expandHome(process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR ?? DEFAULT_DIRECTORY),
+  const directory = expandHome(
+    process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR ?? DEFAULT_DIRECTORY,
   )
-  // Older builds recorded the owner inside the trusted folder. One removal, then it stays gone.
-  await rm(join(directory, "owner.pid"), { force: true })
   const key = ACTIVATION
   const pluginID = PLUGIN_ID
-  let current: (() => Promise<void>) | undefined
+  // Hooks belong to the host instance that set them up. A reload can set up the
+  // next instance before it disposes the last, and that one must still get hooks.
+  const live = new Set<Context>()
   const activation: Activate = async (ctx) => {
     if (!sameIsolationDirectory(ctx.location.directory, directory))
       throw new Error("Reviewer isolation location mismatch")
     // plugin.list and model.list on the host context cannot see this directory.
     noteIsolationContext(directory, ctx)
-    // The host can call setup again after it disposes the previous hooks.
-    // A second call while those hooks are still live must not register them twice.
-    if (current) return async () => {}
-    const cleanup = await activate(ctx)
-    const dispose = async () => {
-      if (current !== dispose) return
-      current = undefined
+    // A repeated setup for an instance whose hooks are still live must not register them twice.
+    if (live.has(ctx)) return async () => {}
+    live.add(ctx)
+    let cleanup: () => Promise<void>
+    try {
+      cleanup = await activate(ctx)
+    } catch (error) {
+      live.delete(ctx)
+      throw error
+    }
+    let disposed = false
+    return async () => {
+      if (disposed) return
+      disposed = true
+      live.delete(ctx)
       await cleanup()
     }
-    current = dispose
-    return dispose
   }
-  activations.set(key, activation)
+  members.set(activation, directory)
+  activations.set(key, (ctx) => activateAll(ctx))
+  const leave = () => {
+    members.delete(activation)
+    if ([...members.values()].some((claimed) => sameIsolationDirectory(claimed, directory))) return
+    forgetIsolationContext(directory)
+    if (members.size === 0) activations.delete(key)
+  }
   // The local config only disables the config MCP loader, so servers that other plugins add
   // from code still reach this location. Global plugins set up before this one, so this
   // transform removes their servers, and a server added later fails the inventory check.
@@ -151,34 +205,48 @@ export async function createIsolatedLocation(
     return activate(ctx);
   } };`
   try {
-    await writeIfChanged(join(directory, "index.js"), source)
-    await writeIfChanged(
-      join(directory, "package.json"),
-      JSON.stringify({
-        name: "permission-reviewer-isolation",
-        private: true,
-        type: "module",
-        exports: "./index.js",
-      }),
-    )
-    await writeIfChanged(
-      join(directory, "opencode.json"),
-      // Keep the explicit reviewer model unchanged by inherited QM agent hooks.
-      JSON.stringify({ plugins: ["-opencode.config.mcp", "-quartermaster", directory] }),
-    )
+    const directoryKey = locationKey(directory)
+    let preparing = preparations.get(directoryKey)
+    if (!preparing) {
+      preparing = (async () => {
+        await claim(directory)
+        // Older builds recorded the owner inside the trusted folder. One removal, then it stays gone.
+        await rm(join(directory, "owner.pid"), { force: true })
+        await writeIfChanged(join(directory, "index.js"), source)
+        await writeIfChanged(
+          join(directory, "package.json"),
+          JSON.stringify({
+            name: "permission-reviewer-isolation",
+            private: true,
+            type: "module",
+            exports: "./index.js",
+          }),
+        )
+        await writeIfChanged(
+          join(directory, "opencode.json"),
+          // Inherited QM hooks would change the model; opencode-usage would write here.
+          JSON.stringify({
+            plugins: ["-opencode.config.mcp", "-quartermaster", "-opencode-usage", directory],
+          }),
+        )
+      })()
+      preparations.set(directoryKey, preparing)
+    }
+    try {
+      await preparing
+    } finally {
+      // Retry after either success or failure, without deleting a newer preparation.
+      if (preparations.get(directoryKey) === preparing) preparations.delete(directoryKey)
+    }
     await bindPublishedContext(directory, activation)
     return {
       directory,
       pluginID,
-      release: () => {
-        // The directory stays: it is what the host was asked to trust.
-        if (activations.get(key) === activation) activations.delete(key)
-        forgetIsolationContext(directory)
-      },
+      // The directory stays: it is what the host was asked to trust.
+      release: leave,
     }
   } catch (error) {
-    if (activations.get(key) === activation) activations.delete(key)
-    forgetIsolationContext(directory)
+    leave()
     throw error
   }
 }

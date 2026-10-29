@@ -24,6 +24,7 @@ export default defineConfig({
     },
   },
   external: [
+    "bun:sqlite",
     "@opencode-ai/plugin",
     "@opencode-ai/plugin/tui",
     "@opencode-ai/sdk",

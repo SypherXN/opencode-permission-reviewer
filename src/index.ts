@@ -8,6 +8,7 @@ import type { RuntimeContext } from "./opencode/types.ts"
 import { createAuditWriter } from "./audit.ts"
 import { setup } from "./opencode/v2/server.ts"
 import { withTimeout } from "./opencode/transport.ts"
+import { createHostDirectUsageClient } from "./system-one/direct-usage.ts"
 
 export const server: Plugin = async (input, options) => {
   // V1 does not report whether plugin options came from global or project
@@ -37,6 +38,14 @@ export const server: Plugin = async (input, options) => {
         .then((response) => response.data?.version)
         .catch(() => undefined)
     : undefined
+  // Quartermaster's RPC bus is not part of the V1 plugin input. A host that
+  // passes one anyway lets the reviewer report its own token counts, which the
+  // host would otherwise file under the isolation project where no usage view
+  // reads them. Without it the reviewer reports nothing and reviews are
+  // unaffected.
+  const usage = createHostDirectUsageClient(input, logger)
+  if (usage === undefined)
+    logger?.("Quartermaster RPC is unavailable on this host; reviewer usage is not reported")
   const ctx: RuntimeContext = {
     ...(hostVersion ? { hostVersion } : {}),
     ...createV1Adapter(
@@ -52,7 +61,7 @@ export const server: Plugin = async (input, options) => {
   // Ask-decision capture runs only when enabled; the registry is the sole
   // consumer of question events and never affects permission handling.
   const askDecisions = config.askDecisions ? new AskDecisionRegistry(logger) : undefined
-  const runtime = new ApprovalReviewerRuntime(ctx, config, logger, undefined, askDecisions)
+  const runtime = new ApprovalReviewerRuntime(ctx, config, logger, undefined, askDecisions, usage)
   return {
     event: async ({ event }) => {
       // Observe synchronously first: reviews started by later events must see

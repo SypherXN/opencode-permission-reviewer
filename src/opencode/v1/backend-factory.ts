@@ -3,6 +3,7 @@ import { isSystemOneReviewerModel } from "../../config.ts"
 import { SystemOneReviewerBackend } from "../../system-one/backend.ts"
 import type { ReviewEnvelope, ReviewExecutionResult, ReviewerConfig } from "../../types.ts"
 import type { RuntimeContext } from "../types.ts"
+import type { DirectUsageSender } from "../../system-one/direct-usage.ts"
 import { V1ReviewerBackend } from "./reviewer-backend.ts"
 
 export interface V1ReviewBackend {
@@ -27,13 +28,14 @@ export function createV1ReviewerBackend(
   config: ReviewerConfig,
   log: (message: string, details?: unknown) => void,
   recordReviewerMs: (envelope: ReviewEnvelope, ms: number) => void,
+  usage?: DirectUsageSender,
 ): V1ReviewBackend {
   if (!isSystemOneReviewerModel(config.model)) {
-    return new V1ReviewerBackend(ctx, config, log, recordReviewerMs)
+    return new V1ReviewerBackend(ctx, config, log, recordReviewerMs, usage)
   }
   const secondaryConfig = escalationConfig(config)
   const secondary = secondaryConfig
-    ? new V1ReviewerBackend(ctx, secondaryConfig, log, recordReviewerMs)
+    ? new V1ReviewerBackend(ctx, secondaryConfig, log, recordReviewerMs, usage)
     : undefined
   // V1 has no Quartermaster RPC client. Enabled routing fail-closes in the
   // System One backend instead of calling the configured model directly.

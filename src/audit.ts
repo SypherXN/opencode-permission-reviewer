@@ -1,12 +1,17 @@
+import type { Database } from "bun:sqlite"
 import { mkdir } from "node:fs/promises"
+import { createRequire } from "node:module"
 import {
   closeSync,
   constants as fsConstants,
   fchmodSync,
   fstatSync,
+  ftruncateSync,
   lstatSync,
   openSync,
   readSync,
+  renameSync,
+  unlinkSync,
   writeSync,
 } from "node:fs"
 import { homedir } from "node:os"
@@ -19,6 +24,7 @@ export const DEFAULT_AUDIT_PATH = "~/.local/share/opencode/permission-reviewer-a
 const O_RDONLY = typeof fsConstants.O_RDONLY === "number" ? fsConstants.O_RDONLY : 0
 const O_WRONLY = typeof fsConstants.O_WRONLY === "number" ? fsConstants.O_WRONLY : 0
 const O_CREAT = typeof fsConstants.O_CREAT === "number" ? fsConstants.O_CREAT : 0
+const O_EXCL = typeof fsConstants.O_EXCL === "number" ? fsConstants.O_EXCL : 0
 const O_APPEND = typeof fsConstants.O_APPEND === "number" ? fsConstants.O_APPEND : 0
 const O_NOFOLLOW = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0
 const O_NONBLOCK = typeof fsConstants.O_NONBLOCK === "number" ? fsConstants.O_NONBLOCK : 0
@@ -76,10 +82,20 @@ function bump(map: Record<string, number>, key: string): void {
   map[key] = (map[key] ?? 0) + 1
 }
 
-/** Cap on how much of an audit file the summary reader will pull into memory:
- *  the file is append-only and grows without bound, and the report only needs
- *  the most recent records. When the cap is hit the reader summarizes the tail
- *  (newest records) and flags the truncation. */
+/** Records older than this are removed by the next rewrite. Lines with no
+ *  parseable timestamp stay, so a corrupt line is not treated as expired. The
+ *  file is append-only between those rewrites. */
+const AUDIT_RETENTION_MS = 24 * 60 * 60 * 1000
+
+/** A rewrite starts only once the oldest record is this far past retention.
+ *  Reviews arrive at a steady rate, so at the bare cutoff some record expires
+ *  before nearly every append, and each append would copy the whole file. */
+const AUDIT_PRUNE_SLACK_MS = 60 * 60 * 1000
+
+/** Cap on how much of an audit file the summary reader will pull into memory.
+ *  The writer drops expired records, and the report still only needs the most
+ *  recent ones. When the cap is hit the reader summarizes the tail (newest
+ *  records) and flags the truncation. */
 const AUDIT_READ_CAP_BYTES = 64 * 1024 * 1024
 
 /** Read the (bounded) tail of an audit file synchronously without loading the
@@ -263,80 +279,414 @@ function boundedReason(reason: string): string {
   return normalized.length <= 2_000 ? normalized : `${normalized.slice(0, 2_000)}…`
 }
 
+function errorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) return
+  const code = (error as { code?: unknown }).code
+  return typeof code === "string" ? code : undefined
+}
+
+type Sqlite = typeof import("bun:sqlite")
+let sqlite: Sqlite | undefined
+
+/** Loaded on first use, never at import: a host that runs plugins outside Bun
+ *  must still load the reviewer, losing only its audit records. */
+function loadSqlite(): Sqlite {
+  sqlite ??= createRequire(import.meta.url)("bun:sqlite") as Sqlite
+  return sqlite
+}
+
+/** SQLite supplies a kernel-backed cross-process mutex, not audit storage.
+ *  Closing it (including process death) releases the lock. Never unlink this
+ *  sidecar: replacing its inode would split the lock between live writers. */
+function openAuditLock(path: string): Database {
+  const lockPath = `${path}.lock.sqlite`
+  for (const candidate of [path, lockPath]) {
+    try {
+      const info = lstatSync(candidate)
+      if (info.isSymbolicLink() || !info.isFile() || info.nlink > 1) {
+        throw new Error(`not a regular single-link file: ${candidate}`)
+      }
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") throw error
+    }
+  }
+  const { Database, constants } = loadSqlite()
+  const db = new Database(
+    lockPath,
+    constants.SQLITE_OPEN_READWRITE | constants.SQLITE_OPEN_CREATE | constants.SQLITE_OPEN_NOFOLLOW,
+  )
+  try {
+    // Wait asynchronously in the writer, never block the host on another process.
+    db.run("PRAGMA busy_timeout = 0")
+    db.run("BEGIN IMMEDIATE")
+    return db
+  } catch (error) {
+    db.close()
+    throw error
+  }
+}
+
+async function waitForAuditLock(path: string): Promise<Database> {
+  const deadline = Date.now() + 5_000
+  for (;;) {
+    try {
+      return openAuditLock(path)
+    } catch (error) {
+      if (errorCode(error) !== "SQLITE_BUSY" || Date.now() >= deadline) throw error
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+}
+
+/** Timestamp of one JSONL record, or undefined when the line is not a record. */
+function recordTimestampMs(line: string): number | undefined {
+  try {
+    const parsed = JSON.parse(line) as { timestamp?: unknown }
+    if (typeof parsed !== "object" || parsed === null || typeof parsed.timestamp !== "string") {
+      return
+    }
+    const ms = Date.parse(parsed.timestamp)
+    return Number.isFinite(ms) ? ms : undefined
+  } catch {
+    return
+  }
+}
+
+function readAt(fd: number, offset: number, length: number): Buffer {
+  const buffer = Buffer.alloc(length)
+  let read = 0
+  while (read < length) {
+    const count = readSync(fd, buffer, read, length - read, offset + read)
+    if (count === 0) break
+    read += count
+  }
+  return read < length ? buffer.subarray(0, read) : buffer
+}
+
+/** True when the oldest dated record is past the cutoff, or none is found near
+ *  the head. An append-only file is oldest-first, so a recent one needs no rewrite. */
+function headNeedsPrune(fd: number, size: number, cutoff: number): boolean {
+  const max = Math.min(size, 256 * 1024)
+  let carry = Buffer.alloc(0)
+  let offset = 0
+  while (offset < max) {
+    const slice = readAt(fd, offset, Math.min(8 * 1024, max - offset))
+    if (slice.length === 0) break
+    offset += slice.length
+    const combined = carry.length === 0 ? slice : Buffer.concat([carry, slice])
+    let start = 0
+    for (let newline = combined.indexOf(0x0a); newline !== -1; newline = combined.indexOf(0x0a, start)) {
+      const timestamp = recordTimestampMs(combined.subarray(start, newline).toString("utf8"))
+      // A rewrite keeps blank and undated lines, so they cannot be why one is needed.
+      if (timestamp !== undefined) return timestamp < cutoff
+      start = newline + 1
+    }
+    carry = Buffer.from(combined.subarray(start))
+  }
+  return true
+}
+
+function writeFully(fd: number, data: Buffer, position?: number): void {
+  let written = 0
+  while (written < data.length) {
+    const count = writeSync(
+      fd,
+      data,
+      written,
+      data.length - written,
+      position === undefined ? undefined : position + written,
+    )
+    if (count === 0) throw new Error("short write")
+    written += count
+  }
+}
+
+/** Copy lines that are still inside the retention window. Expired records are
+ *  counted and dropped. Blank lines are not records and are not copied. */
+function writeRetainedLines(input: number, size: number, output: number, cutoff: number): number {
+  let offset = 0
+  let carry = Buffer.alloc(0)
+  let dropped = 0
+  const keep = (line: Buffer) => {
+    if (line.length === 0) return
+    const text = line.toString("utf8")
+    const timestamp = recordTimestampMs(text)
+    if (timestamp !== undefined && timestamp < cutoff) {
+      dropped++
+      return
+    }
+    writeFully(output, Buffer.concat([line, Buffer.from("\n")]))
+  }
+  while (offset < size) {
+    const slice = readAt(input, offset, Math.min(64 * 1024, size - offset))
+    if (slice.length === 0) break
+    offset += slice.length
+    const combined = carry.length === 0 ? slice : Buffer.concat([carry, slice])
+    let start = 0
+    for (let index = 0; index < combined.length; index++) {
+      if (combined[index] !== 0x0a) continue
+      keep(combined.subarray(start, index))
+      start = index + 1
+    }
+    carry = Buffer.from(combined.subarray(start))
+  }
+  if (carry.length > 0) keep(carry)
+  return dropped
+}
+
+function assertRegularFile(fd: number, path: string): void {
+  if (!fstatSync(fd).isFile()) throw new Error(`not a regular file: ${path}`)
+}
+
+function enforceOwnerMode(fd: number): void {
+  try {
+    if ((fstatSync(fd).mode & 0o7777) !== 0o600) fchmodSync(fd, 0o600)
+  } catch (error) {
+    throw new Error(
+      `cannot enforce mode 0600 on the audit path (chmod 600 it or fix its ownership): ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      { cause: error },
+    )
+  }
+}
+
+/** Open a new regular file. A symlink at this path is refused, never followed. */
+function openFreshRegularFile(path: string): number {
+  let existing: ReturnType<typeof lstatSync> | undefined
+  try {
+    existing = lstatSync(path)
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") throw error
+  }
+  if (existing) {
+    if (existing.isSymbolicLink() || !existing.isFile()) throw new Error(`not a regular file: ${path}`)
+    unlinkSync(path)
+  }
+  const fd = openSync(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+  try {
+    assertRegularFile(fd, path)
+    enforceOwnerMode(fd)
+    return fd
+  } catch (error) {
+    closeSyncSafe(fd)
+    throw error
+  }
+}
+
+function removeRegularFile(path: string): void {
+  let existing: ReturnType<typeof lstatSync>
+  try {
+    existing = lstatSync(path)
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return
+    throw error
+  }
+  if (existing.isSymbolicLink() || !existing.isFile()) throw new Error(`not a regular file: ${path}`)
+  unlinkSync(path)
+}
+
+/** Replace the audit file with the temp file. A rename that cannot overwrite
+ *  copies onto the original descriptor instead, still refusing a symlink. */
+function replaceRegularFile(temp: string, path: string): void {
+  try {
+    renameSync(temp, path)
+    return
+  } catch (error) {
+    const code = errorCode(error)
+    if (code !== "EEXIST" && code !== "EPERM" && code !== "EBUSY") throw error
+  }
+  let source: number | undefined
+  let target: number | undefined
+  try {
+    const existing = lstatSync(path)
+    if (existing.isSymbolicLink() || !existing.isFile()) throw new Error(`not a regular file: ${path}`)
+    source = openSync(temp, O_RDONLY | O_NONBLOCK | O_NOFOLLOW)
+    assertRegularFile(source, temp)
+    target = openSync(path, O_WRONLY | O_NOFOLLOW)
+    assertRegularFile(target, path)
+    enforceOwnerMode(target)
+    let offset = 0
+    for (;;) {
+      const slice = readAt(source, offset, 64 * 1024)
+      if (slice.length === 0) break
+      writeFully(target, slice, offset)
+      offset += slice.length
+    }
+    ftruncateSync(target, offset)
+  } finally {
+    if (source !== undefined) closeSyncSafe(source)
+    if (target !== undefined) closeSyncSafe(target)
+    removeRegularFile(temp)
+  }
+}
+
+/** Drop records older than 24 hours once the oldest is an hour past that.
+ *  Returns how many records were removed. Never follows a symlink. A missing
+ *  file removes nothing. */
+export function pruneExpiredAudit(path: string, now = Date.now()): number {
+  try {
+    const info = lstatSync(path)
+    if (info.isSymbolicLink() || !info.isFile()) return 0
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return 0
+    throw error
+  }
+  const lock = openAuditLock(path)
+  try {
+    return pruneAuditLocked(path, now)
+  } finally {
+    lock.close()
+  }
+}
+
+/** Caller holds the same lock used by every append. */
+function pruneAuditLocked(path: string, now: number): number {
+  let input: number | undefined
+  let output: number | undefined
+  // Separate a crashed process's leftover rewrite from this process's temp file.
+  const temp = `${path}.${process.pid}.tmp`
+  let removeTemp = false
+  try {
+    try {
+      const existing = lstatSync(path)
+      if (existing.isSymbolicLink() || !existing.isFile()) return 0
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return 0
+      throw error
+    }
+    input = openSync(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW)
+    const info = fstatSync(input)
+    if (!info.isFile() || info.size === 0) return 0
+    const cutoff = now - AUDIT_RETENTION_MS
+    if (!headNeedsPrune(input, info.size, cutoff - AUDIT_PRUNE_SLACK_MS)) return 0
+    output = openFreshRegularFile(temp)
+    removeTemp = true
+    const dropped = writeRetainedLines(input, info.size, output, cutoff)
+    closeSyncSafe(output)
+    output = undefined
+    closeSyncSafe(input)
+    input = undefined
+    if (dropped === 0) {
+      removeRegularFile(temp)
+      removeTemp = false
+      return 0
+    }
+    replaceRegularFile(temp, path)
+    removeTemp = false
+    return dropped
+  } finally {
+    if (output !== undefined) closeSyncSafe(output)
+    if (input !== undefined) closeSyncSafe(input)
+    if (removeTemp) {
+      try {
+        removeRegularFile(temp)
+      } catch {
+        // The temp file is only an intermediate rewrite. Leaving a symlink
+        // alone is safer than deleting whatever it points at.
+      }
+    }
+  }
+}
+
 export function createAuditWriter(
   config: ReviewerConfig,
   logger?: (message: string, details?: unknown) => void,
 ): ((record: ReviewAuditRecord) => Promise<void>) | undefined {
   if (!config.audit) return
   const path = expandHome(config.auditPath ?? DEFAULT_AUDIT_PATH)
-  let ready: Promise<void> | undefined
+  let directoryReady: Promise<void> | undefined
+  // Keep this writer's order; the SQLite lock also covers other writers/processes.
+  let tail: Promise<void> = Promise.resolve()
   return async (record) => {
-    try {
-      ready ??= mkdir(dirname(path), { recursive: true }).then(() => {})
-      await ready
-    } catch (error) {
-      // The audit trail is best-effort: a directory that cannot be created
-      // loses the record the same way an append failure does, logged and
-      // never thrown. The cached promise is cleared so a later record retries
-      // the mkdir instead of sticking to the rejection.
-      logger?.("failed to append audit record", {
-        path,
-        error: error instanceof Error ? error.message : String(error),
-      })
-      ready = undefined
-      return
-    }
-    // Redact the free-text fields (the reason carries transport error messages
-    // and provider responses that never passed through the evidence
-    // pipeline's redaction). Structural identifiers are left intact: running
-    // the redactor over the whole serialized line would also match key names
-    // like "sessionID" and corrupt the record's correlation fields.
-    const sanitized: ReviewAuditRecord = {
-      ...record,
-      reason: redactSecrets(boundedReason(record.reason)),
-      ...(record.warnings === undefined
-        ? {}
-        : { warnings: record.warnings.map((warning) => redactSecrets(warning)) }),
-      ...(record.policyTrace === undefined
-        ? {}
-        : {
-            policyTrace: {
-              ...record.policyTrace,
-              // Rule reasons are admin-authored prose; redact them like any
-              // other free text without touching the structural fields.
-              matchedRules: record.policyTrace.matchedRules.map((match) => ({
-                ...match,
-                reason: redactSecrets(match.reason),
+    const run = tail.then(async () => {
+      try {
+        directoryReady ??= mkdir(dirname(path), { recursive: true }).then(() => {})
+        await directoryReady
+      } catch (error) {
+        // The audit trail is best-effort: a directory that cannot be created
+        // loses the record the same way an append failure does, logged and
+        // never thrown. The cached promise is cleared so a later record retries
+        // the mkdir instead of sticking to the rejection.
+        logger?.("failed to append audit record", {
+          path,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        directoryReady = undefined
+        return
+      }
+      // Redact the free-text fields (the reason carries transport error messages
+      // and provider responses that never passed through the evidence
+      // pipeline's redaction). Structural identifiers are left intact: running
+      // the redactor over the whole serialized line would also match key names
+      // like "sessionID" and corrupt the record's correlation fields.
+      const sanitized: ReviewAuditRecord = {
+        ...record,
+        reason: redactSecrets(boundedReason(record.reason)),
+        ...(record.warnings === undefined
+          ? {}
+          : { warnings: record.warnings.map((warning) => redactSecrets(warning)) }),
+        ...(record.policyTrace === undefined
+          ? {}
+          : {
+              policyTrace: {
+                ...record.policyTrace,
+                // Rule reasons are admin-authored prose; redact them like any
+                // other free text without touching the structural fields.
+                matchedRules: record.policyTrace.matchedRules.map((match) => ({
+                  ...match,
+                  reason: redactSecrets(match.reason),
+                })),
+              },
+            }),
+        ...(record.askDecisions === undefined
+          ? {}
+          : {
+              askDecisions: record.askDecisions.map((decision) => ({
+                ...decision,
+                question: redactSecrets(decision.question),
+                answer: redactSecrets(decision.answer),
               })),
-            },
-          }),
-      ...(record.askDecisions === undefined
-        ? {}
-        : {
-            askDecisions: record.askDecisions.map((decision) => ({
-              ...decision,
-              question: redactSecrets(decision.question),
-              answer: redactSecrets(decision.answer),
-            })),
-          }),
-      ...(record.reviewerEscalatedFrom === undefined
-        ? {}
-        : {
-            reviewerEscalatedFrom: {
-              ...record.reviewerEscalatedFrom,
-              reason: redactSecrets(boundedReason(record.reviewerEscalatedFrom.reason)),
-            },
-          }),
-    }
-    try {
-      appendAuditLine(path, `${JSON.stringify(sanitized)}\n`)
-    } catch (error) {
-      // The audit trail is best-effort: a lost record is logged, never thrown.
-      logger?.("failed to append audit record", {
-        path,
-        error: error instanceof Error ? error.message : String(error),
-      })
-    }
+            }),
+        ...(record.reviewerEscalatedFrom === undefined
+          ? {}
+          : {
+              reviewerEscalatedFrom: {
+                ...record.reviewerEscalatedFrom,
+                reason: redactSecrets(boundedReason(record.reviewerEscalatedFrom.reason)),
+              },
+            }),
+      }
+      try {
+        const lock = await waitForAuditLock(path)
+        try {
+          try {
+            const dropped = pruneAuditLocked(path, Date.now())
+            if (dropped > 0) logger?.("pruned audit records older than 24 hours", { path, dropped })
+          } catch (error) {
+            // Retention failure must not discard this record. Still hold the lock.
+            logger?.("failed to prune audit records", {
+              path,
+              error: error instanceof Error ? error.message : String(error),
+            })
+          }
+          appendAuditLine(path, `${JSON.stringify(sanitized)}\n`)
+        } finally {
+          lock.close()
+        }
+      } catch (error) {
+        // The audit trail is best-effort: a lost record is logged, never thrown.
+        logger?.("failed to append audit record", {
+          path,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    })
+    tail = run.then(
+      () => undefined,
+      () => undefined,
+    )
+    await run
   }
 }
 

@@ -21,6 +21,7 @@ import { ReviewAttempt } from "../src/core/review-attempt.ts"
 import type { ReviewEnvelope, ReviewerConfig } from "../src/types.ts"
 import type { RuntimeContext } from "../src/opencode/types.ts"
 import { config, request } from "./helpers.ts"
+import type { DirectUsageReport, DirectUsageSender } from "../src/system-one/direct-usage.ts"
 
 /** A V1 fixture mirroring `v2-backend.test.ts`: the client exposes only the V1
  *  surface (session/tool/mcp.status) and the backend runs against a scratch
@@ -34,6 +35,10 @@ function fixture(
     base?: string
     inventory?: unknown
     timeoutMs?: number
+    tokens?: unknown | unknown[]
+    firstTextInvalid?: boolean
+    createFails?: boolean
+    usage?: DirectUsageSender
   } = {},
 ) {
   const base = options.base ?? mkdtempSync(join(tmpdir(), "reviewer-v1-isolation-"))
@@ -44,10 +49,12 @@ function fixture(
   let mcpStatuses = 0
   let directoriesRead = 0
   const removed = new Set<string>()
+  const reports: DirectUsageReport[] = []
 
   const client = {
     session: {
       create: async (input: { query?: { directory?: string } }) => {
+        if (options.createFails) throw new Error("session create failed")
         const directory = input.query?.directory ?? ""
         directories.push(directory)
         directoriesRead++
@@ -58,11 +65,29 @@ function fixture(
       messages: async () => ({ data: [] }),
       prompt: async () => {
         prompts++
+        const tokens =
+          options.tokens === undefined
+            ? undefined
+            : Array.isArray(options.tokens)
+              ? options.tokens[Math.min(prompts - 1, options.tokens.length - 1)]
+              : options.tokens
+        const tokensField = tokens === undefined ? {} : { tokens }
         return {
           data:
             (options.format ?? "json_schema") === "text"
-              ? { info: {}, parts: [{ type: "text", text: JSON.stringify(decision("allow")) }] }
-              : { info: { structured: decision("allow") } },
+              ? {
+                  info: tokensField,
+                  parts: [
+                    {
+                      type: "text",
+                      text:
+                        prompts === 1 && options.firstTextInvalid
+                          ? "not a decision"
+                          : JSON.stringify(decision("allow")),
+                    },
+                  ],
+                }
+              : { info: { structured: decision("allow"), ...tokensField } },
         }
       },
       delete: async ({ path }: { path: { id: string } }) => {
@@ -117,6 +142,7 @@ function fixture(
     }),
     () => {},
     () => {},
+    options.usage ?? { send: async (report) => void reports.push(report) },
   )
   const envelope: ReviewEnvelope = {
     request: request(),
@@ -138,7 +164,7 @@ function fixture(
         attempt.close("cancelled")
       }
     },
-    state: () => ({ directories, sessionIDs, prompts, mcpStatuses, removed }),
+    state: () => ({ directories, sessionIDs, prompts, mcpStatuses, removed, reports }),
     cleanup: async () => {
       await backend.waitForIdle()
       if (existsSync(base)) await rm(base, { recursive: true, force: true })
@@ -547,3 +573,87 @@ test("separate processes replace shared isolation files without partial reads", 
     await first.cleanup()
   }
 }, 30_000)
+
+test("one completed review reports its session tokens to Quartermaster", async () => {
+  const harness = fixture({
+    tokens: { input: 1200, output: 80, reasoning: 12, cache: { read: 300, write: 40 } },
+  })
+  try {
+    expect((await harness.run()).kind).toBe("allow")
+    const state = harness.state()
+    expect(state.reports).toHaveLength(1)
+    expect(state.reports[0]).toMatchObject({
+      pluginID: "opencode-permission-reviewer",
+      pluginName: "OPR",
+      providerID: "fixture",
+      modelID: "reviewer",
+      variant: "medium",
+      counts: { input: 1200, output: 80, reasoning: 12, cacheRead: 300, cacheWrite: 40 },
+    })
+    expect(state.reports[0]?.usageID).toBe(state.sessionIDs[0])
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("a text-mode retry sums both prompts into a single report", async () => {
+  const harness = fixture({
+    format: "text",
+    firstTextInvalid: true,
+    tokens: [
+      { input: 100, output: 10 },
+      { input: 50, output: 5, reasoning: 1, cache: { read: 2, write: 3 } },
+    ],
+  })
+  try {
+    expect((await harness.run()).kind).toBe("allow")
+    const state = harness.state()
+    expect(state.prompts).toBe(2)
+    expect(state.reports).toHaveLength(1)
+    expect(state.reports[0]?.counts).toEqual({
+      input: 150,
+      output: 15,
+      reasoning: 1,
+      cacheRead: 2,
+      cacheWrite: 3,
+    })
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("a review that never prompts reports no usage", async () => {
+  const harness = fixture({ createFails: true })
+  try {
+    expect((await harness.run()).kind).toBe("escalate")
+    expect(harness.state().reports).toEqual([])
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("a failing usage report does not change the decision", async () => {
+  const harness = fixture({
+    tokens: { input: 7, output: 3 },
+    usage: {
+      send: () => {
+        throw new Error("rpc down")
+      },
+    },
+  })
+  try {
+    expect((await harness.run()).kind).toBe("allow")
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("counts the host does not supply are left out of the report", async () => {
+  const harness = fixture({ tokens: { input: 7, output: 3 } })
+  try {
+    expect((await harness.run()).kind).toBe("allow")
+    expect(harness.state().reports[0]?.counts).toEqual({ input: 7, output: 3 })
+  } finally {
+    await harness.cleanup()
+  }
+})

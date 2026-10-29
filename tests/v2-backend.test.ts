@@ -1,13 +1,16 @@
 import { expect, test } from "bun:test"
 import { existsSync, mkdtempSync } from "node:fs"
-import { readFile, copyFile, rm, stat, utimes, writeFile } from "node:fs/promises"
+import { readFile, copyFile, mkdir, readdir, rm, stat, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { pathToFileURL } from "node:url"
 import type { OpenCodeClient } from "@opencode/client"
 import type { Plugin } from "@opencode/plugin"
 import { createV2ReviewerBackend } from "../src/opencode/v2/backend-factory.ts"
-import { forceReviewerCompletion } from "../src/opencode/v2/reviewer-backend.ts"
+import {
+  forceReviewerCompletion,
+  forceReviewerFrame,
+} from "../src/opencode/v2/reviewer-backend.ts"
 import { createIsolatedLocation } from "../src/opencode/v2/isolated-location.ts"
 import { SYSTEM_ONE_QUESTIONS } from "../src/system-one/review.ts"
 import { DEFAULT_CONFIG } from "../src/config.ts"
@@ -40,6 +43,10 @@ function fixture(
     lowBudget?: boolean
     toolError?: unknown
     toolErrors?: unknown[]
+    streamingStored?: boolean
+    runningStored?: boolean
+    hostStatus?: string
+    argumentsOnly?: boolean
     foreignResponse?: boolean
     missingModel?: boolean
     noTools?: boolean
@@ -48,6 +55,10 @@ function fixture(
     retain?: boolean
     wrongLocation?: boolean
     activeQuartermaster?: boolean
+    stepUsage?: boolean
+    stepIteratorThrows?: boolean
+    stepCloseFails?: "reject" | "throw"
+    subscribeThrows?: boolean
     planRouting?: ReviewerConfig["planRouting"]
     planRoutingRejected?: boolean
     selection?: unknown
@@ -60,8 +71,19 @@ function fixture(
     activationRepresentation?: "directory-slash" | "file-url" | "id-only" | "id-new-path"
     mcpServers?: boolean | "after-first"
     pluginMcp?: boolean
+    hostFollowUpStep?: boolean
+    agreeingDuplicate?: boolean
+    providerError?: boolean
+    rejectedFollowUp?: boolean
+    blindSteps?: number
   } = {},
 ) {
+  let reasked = false
+  // True for each later step of a turn that the reviewer closed without re-asking.
+  const followUps: boolean[] = []
+  const closed = (event: ContextEvent) =>
+    Object.keys(event.tools).length === 0 &&
+    !JSON.stringify([event.system, event.messages]).includes("exactly once")
   const isolationBase = mkdtempSync(join(tmpdir(), "prb-isolation-"))
   const previousIsolationBase = process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
   process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = isolationBase
@@ -81,6 +103,7 @@ function fixture(
   const messagesBySession = new Map<string, string>()
   const attempts: ReviewAttempt[] = []
   let prompts = 0
+  const forcedFrames: boolean[] = []
   let mcpLists = 0
   const mcpTransforms: Array<(editor: McpEditor) => void> = []
   let disposed = 0
@@ -101,8 +124,58 @@ function fixture(
     scope.push(handle)
     return handle
   }
+  const usageReports: unknown[] = []
+  const stepEvents: unknown[] = []
+  let wakeSteps: (() => void) | undefined
+  const subscribe = ({ signal }: { signal: AbortSignal }) =>
+    (async function* () {
+      while (!signal.aborted) {
+        if (stepEvents.length > 0) {
+          yield stepEvents.shift()
+          continue
+        }
+        await new Promise<void>((resolve) => {
+          wakeSteps = resolve
+          signal.addEventListener("abort", () => resolve(), { once: true })
+        })
+      }
+    })()
+  const closeFails = (stream: AsyncGenerator<unknown>) => ({
+    [Symbol.asyncIterator]: () => ({
+      next: () => stream.next(),
+      return: () => {
+        void stream.return(undefined)
+        if (options.stepCloseFails === "throw") throw new Error("event stream close failed")
+        return Promise.reject(new Error("event stream close failed"))
+      },
+    }),
+  })
   const ctx = {
     location: { directory: "/workspace/operational" },
+    ...(options.stepUsage
+      ? {
+          event: {
+            subscribe: options.stepIteratorThrows
+              ? () => ({
+                  [Symbol.asyncIterator]() {
+                    throw new Error("event stream initialization failed")
+                  },
+                })
+              : options.stepCloseFails
+                ? (input: { signal: AbortSignal }) => closeFails(subscribe(input))
+                : subscribe,
+          },
+        }
+      : {}),
+    ...(options.subscribeThrows
+      ? {
+          event: {
+            subscribe: () => {
+              throw new Error("event bus unavailable")
+            },
+          },
+        }
+      : {}),
     rpc: (definition: { id: string }) => ({
       selectPlan: async (input: unknown) => {
         expect(definition.id).toBe("quartermaster")
@@ -110,6 +183,11 @@ function fixture(
         rpcCalls.push(input)
         if (!options.planRouting) throw new Error("Static reviews must not query Quartermaster")
         return options.selection
+      },
+      reportDirectUsage: async (input: unknown) => {
+        expect(definition.id).toBe("quartermaster")
+        usageReports.push(input)
+        return { status: "accepted" }
       },
     }),
     tool: {
@@ -259,6 +337,19 @@ function fixture(
       prompt: async ({ sessionID: current }: { sessionID: string }) => {
         await options.holdPrompt?.()
         prompts++
+        if (options.stepUsage) {
+          stepEvents.push({
+            id: `evt_${current}_${prompts}`,
+            type: "session.step.ended",
+            created: prompts,
+            data: {
+              sessionID: current,
+              assistantMessageID: "message_result",
+              tokens: { input: 100, output: 20, reasoning: 5, cache: { read: 40, write: 0 } },
+            },
+          })
+          wakeSteps?.()
+        }
         const readDefinition = { description: "Native read schema" }
         const shellDefinition = { description: "Native shell schema" }
         const event: ContextEvent = {
@@ -303,6 +394,22 @@ function fixture(
           expect(outgoing.request.headers.get("content-length")).toBeNull()
         }
         messagesBySession.set(current, JSON.stringify(event.messages))
+        // OpenAI Responses requests go over the session socket, not the HTTP hook.
+        const socket = {
+          sessionID: current,
+          kind: "primary",
+          frame: JSON.stringify({
+            type: "response.create",
+            input: [],
+            tools: [{ type: "function", name: "permission_reviewer_result" }],
+          }),
+        }
+        await sessionHooks.get("experimental.ws.send")?.(socket as never)
+        const sentFrame = JSON.parse(socket.frame)
+        forcedFrames.push(
+          sentFrame.tool_choice?.name === "permission_reviewer_result" &&
+            sentFrame.parallel_tool_calls === false,
+        )
         expect(JSON.stringify(event.system)).not.toContain("UNTRUSTED_SYSTEM")
         expect(JSON.stringify(event.messages)).not.toContain("UNTRUSTED_HISTORY")
         expect(event.tools.shell).toBeUndefined()
@@ -331,13 +438,78 @@ function fixture(
           options.textBody === undefined &&
           options.reasoningBody === undefined &&
           options.toolError === undefined &&
-          options.toolErrors === undefined
+          options.toolErrors === undefined &&
+          !options.argumentsOnly &&
+          !options.providerError
         ) {
           await tool.execute(tool.input.parse(decision("allow")), { sessionID: current })
+          if (options.agreeingDuplicate)
+            await tool.execute(
+              { ...decision("allow"), rationale: "The same decision, worded again.", confidence: 0.75 },
+              { sessionID: current },
+            )
           if (options.ambiguous)
             await expect(tool.execute(decision("deny"), { sessionID: current })).rejects.toThrow(
               "ambiguous",
             )
+        }
+        if (options.hostFollowUpStep) {
+          // The host continues after a tool call and builds a context for that step.
+          const next: ContextEvent = {
+            sessionID: current,
+            system: ["UNTRUSTED_SYSTEM"],
+            messages: ["UNTRUSTED_HISTORY"],
+            tools: { permission_reviewer_result: tool },
+          }
+          contextHook(next)
+          expect(next.tools).toEqual({})
+          reasked = JSON.stringify([next.system, next.messages]).includes("exactly once")
+        }
+        if (options.rejectedFollowUp) {
+          // The host runs another step after a rejected call, and its history shows the call.
+          const next: ContextEvent = {
+            sessionID: current,
+            system: ["UNTRUSTED_SYSTEM"],
+            messages: [
+              { role: "user", content: [{ type: "text", text: "evidence" }] },
+              {
+                role: "assistant",
+                content: [
+                  {
+                    type: "tool-call",
+                    id: "call_result",
+                    name: "permission_reviewer_result",
+                    input: {},
+                  },
+                ],
+              },
+              {
+                role: "tool",
+                content: [
+                  {
+                    type: "tool-result",
+                    id: "call_result",
+                    name: "permission_reviewer_result",
+                    result: { type: "error", value: "Invalid" },
+                  },
+                ],
+              },
+            ],
+            tools: { permission_reviewer_result: tool },
+          }
+          contextHook(next)
+          followUps.push(closed(next))
+        }
+        for (let step = 0; step < (options.blindSteps ?? 0); step++) {
+          // A history that does not show the call still stops at the step cap.
+          const next: ContextEvent = {
+            sessionID: current,
+            system: ["UNTRUSTED_SYSTEM"],
+            messages: ["UNTRUSTED_HISTORY"],
+            tools: { permission_reviewer_result: tool },
+          }
+          contextHook(next)
+          followUps.push(closed(next))
         }
         return { id: "inbox_fixture" }
       },
@@ -351,8 +523,12 @@ function fixture(
         {
           type: "assistant",
           id: "message_result",
-          content:
-            options.reasoningBody !== undefined &&
+          ...(options.providerError
+            ? { error: { type: "api", status: 400, message: "Unsupported parameter: tool_choice" } }
+            : {}),
+          content: options.providerError
+            ? []
+            : options.reasoningBody !== undefined &&
             options.textBody === undefined &&
             options.toolError === undefined &&
             options.toolErrors === undefined
@@ -402,8 +578,35 @@ function fixture(
                           type: "tool",
                           id: "call_result",
                           name: "permission_reviewer_result",
-                          state: { status: "completed" },
+                          state: {
+                            status:
+                              options.hostStatus ??
+                              (options.runningStored
+                                ? "running"
+                                : options.streamingStored
+                                  ? "streaming"
+                                  : "completed"),
+                            ...(options.argumentsOnly || options.hostFollowUpStep
+                              ? { input: decision("allow") }
+                              : {}),
+                          },
                         },
+                        // A re-asked model reviews again and calls the tool the host no
+                        // longer offers; its rationale differs from the stored decision.
+                        ...(reasked
+                          ? [
+                              {
+                                type: "tool",
+                                id: "call_again",
+                                name: "permission_reviewer_result",
+                                state: {
+                                  status: "error",
+                                  input: { ...decision("allow"), rationale: "Second independent review" },
+                                  error: { type: "unknown", message: "Tool not available" },
+                                },
+                              },
+                            ]
+                          : []),
                       ],
         },
       ],
@@ -479,8 +682,11 @@ function fixture(
       requestedVariant,
       requestedModel,
       rpcCalls,
+      usageReports: [...usageReports],
       messagesBySession,
       prompts,
+      forcedFrames: [...forcedFrames],
+      followUps: [...followUps],
       mcpLists,
       mcpTransforms: mcpTransforms.length,
       disposed,
@@ -767,6 +973,168 @@ test("a structured reviewer accepts one normalized decision from text or a rejec
   }
 })
 
+test("one decision stands whatever label the host has put on the tool call", async () => {
+  for (const options of [
+    { hostStatus: "settling" },
+    { hostStatus: "settling", argumentsOnly: true },
+  ]) {
+    const harness = fixture(options)
+    try {
+      const result = await harness.run()
+      expect(result.kind).toBe("allow")
+      expect(result.decisionSource).toBe("llm-reviewer")
+      expect(harness.state().prompts).toBe(1)
+    } finally {
+      await harness.cleanup()
+    }
+  }
+})
+
+test("a stored decision still counts when the host leaves the tool call running", async () => {
+  const harness = fixture({ runningStored: true })
+  try {
+    const result = await harness.run()
+    expect(result.kind).toBe("allow")
+    expect(result.decisionSource).toBe("llm-reviewer")
+    expect(harness.state().prompts).toBe(1)
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("a stored decision still counts when the host leaves the tool call streaming", async () => {
+  const harness = fixture({ streamingStored: true })
+  try {
+    const result = await harness.run()
+    expect(result.kind).toBe("allow")
+    expect(result.decisionSource).toBe("llm-reviewer")
+    expect(harness.state().prompts).toBe(1)
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("the host's follow-up step after the decision does not re-ask the review", async () => {
+  const harness = fixture({ hostFollowUpStep: true })
+  try {
+    const result = await harness.run()
+    expect(result.kind).toBe("allow")
+    expect(result.decisionSource).toBe("llm-reviewer")
+    expect(harness.state().prompts).toBe(1)
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("a rejected decision call closes the turn instead of repeating it", async () => {
+  // The tool schema rejects a string version; the review loop normalizes it.
+  const harness = fixture({
+    toolError: { ...decision("allow"), version: "2" },
+    rejectedFollowUp: true,
+  })
+  try {
+    const result = await harness.run()
+    expect(result.kind).toBe("allow")
+    expect(result.decision?.version).toBe(2)
+    expect(harness.state().prompts).toBe(1)
+    expect(harness.state().followUps).toEqual([true])
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("the step cap closes a turn whose history does not show the call", async () => {
+  const harness = fixture({ toolError: { ...decision("allow"), version: 3 }, blindSteps: 3 })
+  try {
+    const result = await harness.run()
+    expect(result.kind).toBe("escalate")
+    expect(result.reason).toContain("the decision call had invalid arguments")
+    expect(harness.state().prompts).toBe(3)
+    // Each turn sends the review twice more, then closes; every new turn starts over.
+    expect(harness.state().followUps).toEqual([
+      false, false, true,
+      false, false, true,
+      false, false, true,
+    ])
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("more decision calls than one turn allows are named in the failure", async () => {
+  const harness = fixture({ toolErrors: [1, 2, 3, 4].map(() => decision("allow")) })
+  try {
+    const result = await harness.run()
+    expect(result.kind).toBe("escalate")
+    expect(result.reason).toContain("too many decision calls (4)")
+    expect(harness.state().prompts).toBe(1)
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("the socket frame requires one decision call, and other wire formats are left alone", () => {
+  expect(
+    forceReviewerFrame({
+      type: "response.create",
+      input: [],
+      tools: [{ type: "function", name: "permission_reviewer_result" }],
+    }),
+  ).toMatchObject({
+    tool_choice: { type: "function", name: "permission_reviewer_result" },
+    parallel_tool_calls: false,
+  })
+  expect(
+    forceReviewerFrame({ type: "response.create", tools: [{ type: "function", name: "shell" }] }),
+  ).toBeUndefined()
+  expect(forceReviewerFrame({ type: "session.update", tools: [] })).toBeUndefined()
+  // Anthropic names the same tool without an OpenAI type; its body takes no OpenAI fields.
+  expect(
+    forceReviewerCompletion({
+      messages: [],
+      max_tokens: 32,
+      tools: [{ name: "permission_reviewer_result", input_schema: { type: "object" } }],
+    }),
+  ).toBeUndefined()
+})
+
+test("decision calls that agree are one decision at the lowest confidence", async () => {
+  const harness = fixture({ agreeingDuplicate: true })
+  try {
+    const result = await harness.run()
+    expect(result.kind).toBe("allow")
+    expect(result.decision?.confidence).toBe(0.75)
+    expect(harness.state().prompts).toBe(1)
+    expect(harness.state().forcedFrames).toEqual([true])
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("a provider error is named in the failure and stops forcing the tool", async () => {
+  const harness = fixture({ providerError: true })
+  try {
+    const result = await harness.run()
+    expect(result.kind).toBe("escalate")
+    expect(result.reason).toContain("provider error 400 api: Unsupported parameter: tool_choice")
+    expect(harness.state().prompts).toBe(3)
+    expect(harness.state().forcedFrames).toEqual([true, false, false])
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("a reply without a decision call says so in the failure", async () => {
+  const harness = fixture({ textBody: "I reviewed it and it looks fine." })
+  try {
+    const result = await harness.run()
+    expect(result.kind).toBe("escalate")
+    expect(result.reason).toContain("no decision call; the reply was text")
+  } finally {
+    await harness.cleanup()
+  }
+})
+
 test("invalid, ambiguous, and foreign execution outputs never become approvals", async () => {
   for (const options of [
     { invalid: true },
@@ -813,14 +1181,14 @@ test("a failed isolation bootstrap is retried in a new location", async () => {
     expect(first.kind).toBe("escalate")
     expect(first.reason).toContain("failed to activate")
     expect(harness.state().directories).toHaveLength(1)
-    expect(harness.state().disposed).toBe(4)
+    expect(harness.state().disposed).toBe(5)
     const failedDirectory = harness.state().directory
 
     const second = await harness.run()
     expect(second.kind).toBe("allow")
     const recovered = harness.state()
     expect(recovered.setups).toBe(2)
-    expect(recovered.disposed).toBe(4)
+    expect(recovered.disposed).toBe(5)
     expect(recovered.directories).toHaveLength(2)
     expect(recovered.directory).toBe(failedDirectory)
     expect(existsSync(failedDirectory + "/opencode.json")).toBe(true)
@@ -834,10 +1202,10 @@ test("backend disposal releases hooks registered by a later location activation"
   try {
     expect((await harness.run()).kind).toBe("allow")
     await harness.reload()
-    expect(harness.state().disposed).toBe(4)
+    expect(harness.state().disposed).toBe(5)
     expect((await harness.run()).kind).toBe("allow")
     await harness.backend.dispose()
-    expect(harness.state().disposed).toBe(8)
+    expect(harness.state().disposed).toBe(10)
     expect(existsSync(harness.state().directory + "/opencode.json")).toBe(true)
   } finally {
     await harness.cleanup()
@@ -932,13 +1300,14 @@ test("review sessions share one MCP-free location without mixing concurrent evid
     expect(isolatedConfig.plugins).toEqual([
       "-opencode.config.mcp",
       "-quartermaster",
+      "-opencode-usage",
       state.directory,
     ])
     expect((await harness.run("Review one more unique marker")).kind).toBe("allow")
     expect(harness.state().directory).toBe(state.directory)
     expect(harness.state().setups).toBe(1)
     await harness.backend.dispose()
-    expect(harness.state().disposed).toBe(4)
+    expect(harness.state().disposed).toBe(5)
     expect(existsSync(state.directory + "/opencode.json")).toBe(true)
     expect(existsSync(join(state.directory, "owner.pid"))).toBe(false)
     expect(() => harness.run()).toThrow("shutting down")
@@ -979,6 +1348,7 @@ test("a deleted isolation location is replaced only after its reviewer sessions 
     expect(isolatedConfig.plugins).toEqual([
       "-opencode.config.mcp",
       "-quartermaster",
+      "-opencode-usage",
       state.directory,
     ])
     expect(existsSync(original)).toBe(true)
@@ -1083,6 +1453,76 @@ test("an unconfirmed reviewer session does not block the next review", async () 
   }
 })
 
+test("concurrent cold starts prepare one trusted isolation folder", async () => {
+  const previous = process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+  try {
+    for (let round = 0; round < 10; round++) {
+      const base = mkdtempSync(join(tmpdir(), "prb-cold-start-"))
+      process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = base
+      const results = await Promise.allSettled(
+        Array.from({ length: 8 }, (_, index) => {
+          // Different spellings of the same folder must use the same preparation.
+          process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR =
+            index % 2 === 0
+              ? base
+              : process.platform === "win32"
+                ? base.replaceAll("\\", "/").toUpperCase()
+                : `${base}/.`
+          return createIsolatedLocation(async () => async () => {})
+        }),
+      )
+      try {
+        expect(results.filter((result) => result.status === "rejected")).toEqual([])
+        for (const result of results) {
+          if (result.status === "fulfilled") expect(existsSync(result.value.directory)).toBe(true)
+        }
+        expect((await readdir(base)).sort()).toEqual(["index.js", "opencode.json", "package.json"])
+      } finally {
+        for (const result of results) {
+          if (result.status === "fulfilled") result.value.release()
+        }
+        await rm(base, { recursive: true, force: true })
+        await rm(`${base}.owner`, { force: true })
+      }
+    }
+  } finally {
+    if (previous === undefined) delete process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+    else process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = previous
+  }
+})
+
+test("failed shared-folder preparation can be retried", async () => {
+  const base = mkdtempSync(join(tmpdir(), "prb-prepare-retry-"))
+  const previous = process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+  process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = base
+  const locations: Awaited<ReturnType<typeof createIsolatedLocation>>[] = []
+  try {
+    await mkdir(join(base, "index.js"))
+    const failed = await Promise.allSettled(
+      Array.from({ length: 4 }, () => createIsolatedLocation(async () => async () => {})),
+    )
+    for (const result of failed) {
+      if (result.status === "fulfilled") locations.push(result.value)
+    }
+    expect(failed.every((result) => result.status === "rejected")).toBe(true)
+    await rm(join(base, "index.js"), { recursive: true })
+    const retried = await Promise.allSettled(
+      Array.from({ length: 4 }, () => createIsolatedLocation(async () => async () => {})),
+    )
+    for (const result of retried) {
+      if (result.status === "fulfilled") locations.push(result.value)
+    }
+    expect(retried.filter((result) => result.status === "rejected")).toEqual([])
+    expect(locations).toHaveLength(4)
+  } finally {
+    for (const location of locations) location.release()
+    if (previous === undefined) delete process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+    else process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = previous
+    await rm(base, { recursive: true, force: true })
+    await rm(`${base}.owner`, { force: true })
+  }
+})
+
 test("a repeated isolation claim leaves trusted files and their timestamps untouched", async () => {
   const base = mkdtempSync(join(tmpdir(), "prb-stable-"))
   const previous = process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
@@ -1178,6 +1618,386 @@ test("a setup that ran before activation binds without rewriting the folder", as
     expect(bound).toBe(1)
   } finally {
     second?.release()
+    if (previous === undefined) delete process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+    else process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = previous
+    await rm(base, { recursive: true, force: true })
+    await rm(`${base}.owner`, { force: true })
+  }
+})
+
+test("reviewer steps in the isolation folder are reported to Quartermaster with their model", async () => {
+  const harness = fixture({ stepUsage: true, variant: "max" })
+  try {
+    expect((await harness.run()).kind).toBe("allow")
+    for (let index = 0; index < 100 && harness.state().usageReports.length === 0; index++)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    const state = harness.state()
+    expect(state.usageReports).toEqual([
+      {
+        pluginID: "opencode-permission-reviewer",
+        pluginName: "OPR",
+        usageID: `evt_${state.sessionID}_1:fixture/reviewer`,
+        providerID: "fixture",
+        modelID: "reviewer",
+        variant: "max",
+        counts: { input: 100, output: 20, reasoning: 5, cacheRead: 40, cacheWrite: 0 },
+      },
+    ])
+    expect((await harness.run()).kind).toBe("allow")
+    for (let index = 0; index < 100 && harness.state().usageReports.length < 2; index++)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    expect(harness.state().usageReports).toHaveLength(2)
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("usage stream initialization and close failures leak no unhandled rejection", async () => {
+  for (const failure of ["iterator", "reject", "throw"] as const) {
+    const unhandled: unknown[] = []
+    const record = (reason: unknown) => void unhandled.push(reason)
+    process.on("unhandledRejection", record)
+    const harness = fixture({
+      stepUsage: true,
+      ...(failure === "iterator" ? { stepIteratorThrows: true } : { stepCloseFails: failure }),
+    })
+    try {
+      expect((await harness.run()).kind).toBe("allow")
+    } finally {
+      await harness.cleanup()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      process.off("unhandledRejection", record)
+    }
+    expect(unhandled).toEqual([])
+  }
+})
+
+test("a host that refuses the usage subscription still gets a working reviewer", async () => {
+  const harness = fixture({ subscribeThrows: true })
+  try {
+    expect((await harness.run()).kind).toBe("allow")
+    expect(harness.state().prompts).toBe(1)
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+/** Projects whose backends all claim the folder named by OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR. */
+function sharedIsolationHost() {
+  const name = "permission_reviewer_result"
+  const handle = <T,>(list: T[], item: T) => {
+    list.push(item)
+    return {
+      dispose: async () => {
+        const index = list.indexOf(item)
+        if (index >= 0) list.splice(index, 1)
+      },
+    }
+  }
+  // The host keeps one instance of the folder and runs every plugin's hooks on it.
+  const instance = (directory: string) => {
+    const definitions: Tool[] = []
+    const contextHooks: Array<(event: ContextEvent) => void> = []
+    const ctx = {
+      location: { directory },
+      mcp: {
+        transform: async (callback: (editor: { list(): []; remove(name: string): void }) => void) => {
+          callback({ list: () => [], remove: () => {} })
+          return { dispose: async () => {} }
+        },
+      },
+      tool: {
+        transform: async (callback: (editor: { add(definition: Tool): void }) => void) => {
+          let added!: Tool
+          callback({ add: (definition) => void (added = definition) })
+          return handle(definitions, added)
+        },
+        hook: async () => ({ dispose: async () => {} }),
+      },
+      session: {
+        hook: async (hook: string, callback: (event: never) => unknown) =>
+          hook === "context"
+            ? handle(contextHooks, callback as (event: ContextEvent) => void)
+            : { dispose: async () => {} },
+      },
+    } as unknown as Context
+    return { ctx, definitions, contextHooks }
+  }
+  let current: ReturnType<typeof instance> | undefined
+  let hostCleanup: (() => Promise<void>) | undefined
+  let loading: Promise<void> | undefined
+  let loads = 0
+  const setUp = async (directory: string) => {
+    loads++
+    const plugin = await import(pathToFileURL(join(directory, "index.js")).href)
+    const next = instance(directory)
+    const cleanup = await plugin.default.setup(next.ctx)
+    const last = hostCleanup
+    current = next
+    hostCleanup = cleanup
+    await last?.()
+  }
+  const offered: string[][] = []
+  const replies = new Map<string, unknown[]>()
+  let held: { count: number; arrived: number; ready(): void; gate: Promise<void> } | undefined
+  let release: (() => void) | undefined
+  const client = {
+    plugin: {
+      list: async ({ location }: { location: { directory: string } }) => {
+        // Projects that start together wait for the same load.
+        if (!current) await (loading ??= setUp(location.directory))
+        return {
+          data: [
+            {
+              id: "permission-reviewer-isolation",
+              source: { type: "local", path: join(location.directory, "index.js") },
+              state: { status: "active" },
+            },
+          ],
+        }
+      },
+    },
+    model: {
+      list: async () => ({
+        data: [
+          {
+            providerID: "fixture",
+            id: "reviewer",
+            capabilities: { tools: true },
+            variants: [{ id: "max" }],
+          },
+        ],
+      }),
+    },
+    mcp: {
+      list: async (input: { location: { directory: string } }) => ({
+        location: input.location,
+        data: [],
+      }),
+    },
+    session: {
+      create: async (input: { id: string; location: { directory: string } }) => ({
+        id: input.id,
+        location: input.location,
+      }),
+      prompt: async ({ sessionID, text }: { sessionID: string; text: string }) => {
+        const hold = held
+        if (hold) {
+          if (++hold.arrived === hold.count) hold.ready()
+          await hold.gate
+        }
+        // A name-keyed registry: the last definition added is the one offered.
+        const event: ContextEvent = {
+          sessionID,
+          system: [],
+          messages: [],
+          tools: { [name]: current!.definitions.at(-1), shell: {} },
+        }
+        for (const hook of current!.contextHooks) hook(event)
+        expect(event.messages).toEqual([{ role: "user", content: [{ type: "text", text }] }])
+        offered.push(Object.keys(event.tools))
+        const offer = event.tools[name] as Tool | undefined
+        const content: unknown[] = []
+        if (offer) {
+          const input = decision("allow")
+          let status = "completed"
+          try {
+            await offer.execute(offer.input.parse(input), { sessionID })
+          } catch {
+            status = "error"
+          }
+          // Recovery from stored arguments must not hide broken tool dispatch.
+          expect(status).toBe("completed")
+          content.push({ type: "tool", id: "call_result", name, state: { status, input } })
+        }
+        replies.set(sessionID, content)
+        return { id: `inbox_${sessionID}` }
+      },
+      wait: async () => {},
+      context: async ({ sessionID }: { sessionID: string }) => [
+        { type: "user", id: `inbox_${sessionID}`, text: "evidence" },
+        {
+          type: "assistant",
+          id: `reply_${sessionID}`,
+          finish: "stop",
+          content: replies.get(sessionID) ?? [],
+        },
+      ],
+      interrupt: async () => {},
+      remove: async () => {},
+      get: async () => {
+        throw { _tag: "SessionNotFoundError" }
+      },
+    },
+  } as unknown as OpenCodeClient
+  const project = (directory: string) => ({
+    directory,
+    backend: createV2ReviewerBackend(
+      { location: { directory }, rpc: () => ({}) } as unknown as Context,
+      config({ model: "fixture/reviewer", variant: "max", outputFormat: "json_schema" }),
+    ),
+  })
+  const attempts: ReviewAttempt[] = []
+  let serial = 0
+  const review = ({ backend, directory }: ReturnType<typeof project>) => {
+    const attempt = new ReviewAttempt("generation_shared", 5000)
+    attempts.push(attempt)
+    const evidence = `Run printf safe: review evidence marker ${++serial}`
+    return backend.review(
+      {
+        request: request(),
+        directory,
+        worktree: directory,
+        transcript: evidence,
+        intentHistory: evidence,
+        enrichment: "",
+        sshAudit: [],
+      },
+      attempt,
+      client,
+    )
+  }
+  return {
+    name,
+    offered,
+    project,
+    review,
+    setUp,
+    loads: () => loads,
+    /** Park the next `count` prompts until release(), so their reviews overlap. */
+    hold(count: number) {
+      let ready!: () => void
+      let open!: () => void
+      const arrived = new Promise<void>((resolve) => (ready = resolve))
+      held = { count, arrived: 0, ready, gate: new Promise<void>((resolve) => (open = resolve)) }
+      release = () => {
+        held = undefined
+        open()
+      }
+      return {
+        release,
+        /** A review that ends before every prompt arrived never overlapped the others. */
+        overlapped: (reviews: Array<Promise<unknown>>) =>
+          Promise.race([
+            arrived,
+            ...reviews.map((review) =>
+              review.then((result) => {
+                throw new Error(`A review ended before ${count} prompts overlapped: ${JSON.stringify(result)}`)
+              }),
+            ),
+          ]),
+      }
+    },
+    async close(projects: Array<ReturnType<typeof project>>) {
+      release?.()
+      for (const attempt of attempts) attempt.close("cancelled")
+      for (const { backend } of projects) await backend.dispose()
+      await hostCleanup?.()
+    },
+  }
+}
+
+test("projects keep concurrent reviews isolated across a reload and backend disposal", async () => {
+  const base = mkdtempSync(join(tmpdir(), "prb-shared-"))
+  const previous = process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+  process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = base
+  const host = sharedIsolationHost()
+  const { review } = host
+  const first = host.project("/workspace/first")
+  const second = host.project("/workspace/second")
+  try {
+    expect((await review(first))).toMatchObject({ kind: "allow" })
+    // A second project's first review binds its hooks to the same instance.
+    expect((await review(second))).toMatchObject({ kind: "allow" })
+    expect((await review(first))).toMatchObject({ kind: "allow" })
+    const overlap = host.hold(16)
+    const concurrent = Array.from({ length: 16 }, (_, index) =>
+      review(index % 2 === 0 ? first : second),
+    )
+    await overlap.overlapped(concurrent)
+    // Reload while both projects have eight in-flight reviews. New hooks must
+    // route each session's own prompt and decision after the old hooks go away.
+    await host.setUp(base)
+    overlap.release()
+    for (const result of await Promise.all(concurrent)) expect(result).toMatchObject({ kind: "allow" })
+    expect((await review(first))).toMatchObject({ kind: "allow" })
+    expect((await review(second))).toMatchObject({ kind: "allow" })
+    await first.backend.dispose()
+    expect((await review(second))).toMatchObject({ kind: "allow" })
+    expect(host.offered).toEqual(Array.from({ length: 22 }, () => [host.name]))
+  } finally {
+    await host.close([first, second])
+    if (previous === undefined) delete process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+    else process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = previous
+    await rm(base, { recursive: true, force: true })
+    await rm(`${base}.owner`, { force: true })
+  }
+})
+
+test("projects whose first reviews start together share one prepared isolation folder", async () => {
+  const base = mkdtempSync(join(tmpdir(), "prb-shared-cold-"))
+  const previous = process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+  process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = base
+  const host = sharedIsolationHost()
+  const projects = Array.from({ length: 4 }, (_, index) => host.project(`/workspace/cold-${index}`))
+  try {
+    // Every backend prepares the folder for its first review, as when the app opens several sessions.
+    const overlap = host.hold(8)
+    const reviews = projects.flatMap((project) => [host.review(project), host.review(project)])
+    await overlap.overlapped(reviews)
+    overlap.release()
+    for (const result of await Promise.all(reviews)) expect(result).toMatchObject({ kind: "allow" })
+    expect(host.loads()).toBe(1)
+    expect((await readdir(base)).sort()).toEqual(["index.js", "opencode.json", "package.json"])
+    expect(host.offered).toEqual(Array.from({ length: 8 }, () => [host.name]))
+  } finally {
+    await host.close(projects)
+    if (previous === undefined) delete process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+    else process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = previous
+    await rm(base, { recursive: true, force: true })
+    await rm(`${base}.owner`, { force: true })
+  }
+})
+
+test("a host instance set up before the last one is disposed still gets its own hooks", async () => {
+  const base = mkdtempSync(join(tmpdir(), "prb-reload-"))
+  const previous = process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
+  process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = base
+  const bound: unknown[] = []
+  let disposed = 0
+  const location = await createIsolatedLocation(async (ctx) => {
+    bound.push(ctx)
+    return async () => void disposed++
+  })
+  try {
+    const plugin = await import(pathToFileURL(join(location.directory, "index.js")).href)
+    const instance = () => ({
+      location: { directory: location.directory },
+      mcp: {
+        transform: async (
+          callback: (editor: { list(): []; remove(name: string): void }) => void,
+        ) => {
+          await callback({ list: () => [], remove: () => {} })
+          return async () => {}
+        },
+      },
+    })
+    const first = instance()
+    const second = instance()
+    const disposeFirst = await plugin.default.setup(first)
+    await plugin.default.setup(first)
+    expect(bound).toHaveLength(1)
+    const disposeSecond = await plugin.default.setup(second)
+    expect(bound).toHaveLength(2)
+    expect(bound[0]).toBe(first)
+    expect(bound[1]).toBe(second)
+    await disposeFirst()
+    await disposeFirst()
+    expect(disposed).toBe(1)
+    await disposeSecond()
+    expect(disposed).toBe(2)
+  } finally {
+    location.release()
     if (previous === undefined) delete process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR
     else process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = previous
     await rm(base, { recursive: true, force: true })

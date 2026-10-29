@@ -16,6 +16,12 @@ import { redactSecrets } from "../../redact.ts"
 import { extractStructured, extractText, responseData, withTimeout } from "../transport.ts"
 import { applyEscalationDisposition } from "../../escalation.ts"
 import { formatFailureReason } from "../../failure-reason.ts"
+import {
+  DIRECT_USAGE_PLUGIN_ID,
+  DIRECT_USAGE_PLUGIN_NAME,
+  type DirectUsageCounts,
+  type DirectUsageSender,
+} from "../../system-one/direct-usage.ts"
 
 /**
  * Corrective instruction appended to a text-mode parse-failure retry. Text mode
@@ -29,6 +35,59 @@ const TEXT_MODE_RETRY_NOTE =
   "exactly one JSON object conforming to the schema and nothing else - no prose, " +
   "no Markdown code fences, no commentary, and no copy of the schema."
 
+function record(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined
+}
+
+function whole(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+}
+
+/**
+ * Token counts the host reported for one prompt, or undefined when it reported
+ * none. The prompt response already carries the assistant message, so no
+ * session read is needed - which matters because the session is deleted as soon
+ * as the review settles.
+ */
+function promptUsage(response: ClientResponse<Record<string, unknown>>): DirectUsageCounts | undefined {
+  const tokens = record(record(responseData(response, "session.prompt"))?.info)?.tokens
+  const fields = record(tokens)
+  if (fields === undefined) return undefined
+  const input = whole(fields.input)
+  const output = whole(fields.output)
+  if (input === undefined || output === undefined) return undefined
+  const counts: DirectUsageCounts = { input, output }
+  const reasoning = whole(fields.reasoning)
+  if (reasoning !== undefined) counts.reasoning = reasoning
+  const cache = record(fields.cache)
+  const cacheRead = whole(cache?.read)
+  if (cacheRead !== undefined) counts.cacheRead = cacheRead
+  const cacheWrite = whole(cache?.write)
+  if (cacheWrite !== undefined) counts.cacheWrite = cacheWrite
+  return counts
+}
+
+/** Adds one prompt's counts to the session total, keeping fields any prompt reported. */
+function addUsage(
+  total: DirectUsageCounts | undefined,
+  next: DirectUsageCounts | undefined,
+): DirectUsageCounts | undefined {
+  if (next === undefined) return total
+  if (total === undefined) return next
+  const sum = (a: number | undefined, b: number | undefined) =>
+    a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0)
+  const counts: DirectUsageCounts = { input: total.input + next.input, output: total.output + next.output }
+  const reasoning = sum(total.reasoning, next.reasoning)
+  if (reasoning !== undefined) counts.reasoning = reasoning
+  const cacheRead = sum(total.cacheRead, next.cacheRead)
+  if (cacheRead !== undefined) counts.cacheRead = cacheRead
+  const cacheWrite = sum(total.cacheWrite, next.cacheWrite)
+  if (cacheWrite !== undefined) counts.cacheWrite = cacheWrite
+  return counts
+}
+
 /** Owns isolated reviewer sessions, model calls, and their bounded cleanup. */
 export class V1ReviewerBackend {
   private readonly reviewerSessions = new Set<string>()
@@ -41,6 +100,7 @@ export class V1ReviewerBackend {
     private readonly config: ReviewerConfig,
     private readonly log: (message: string, details?: unknown) => void,
     private readonly recordReviewerMs: (envelope: ReviewEnvelope, ms: number) => void,
+    private readonly usage?: DirectUsageSender,
   ) {
     this.metadataCallTimeoutMs = Math.min(config.timeoutMs, 10_000)
   }
@@ -282,6 +342,7 @@ export class V1ReviewerBackend {
     const model = { providerID, modelID }
     let reviewSessionID: string | undefined
     let sessionDirectory: string | undefined
+    let usageTotal: DirectUsageCounts | undefined
 
     try {
       if (this.config.planRouting || this.config.planRoutingRejected)
@@ -341,6 +402,7 @@ export class V1ReviewerBackend {
       // reviewerMs in the audit before responseData throws below.
       this.recordReviewerMs(envelope, reviewerMs)
       const data = responseData(first.response, "session.prompt")
+      usageTotal = addUsage(usageTotal, promptUsage(first.response))
       const parsed =
         this.config.outputFormat === "text"
           ? parseDecisionFromText(extractText(data) ?? "")
@@ -366,6 +428,7 @@ export class V1ReviewerBackend {
         reviewerMs += retry.ms
         this.recordReviewerMs(envelope, reviewerMs)
         const retryData = responseData(retry.response, "session.prompt")
+        usageTotal = addUsage(usageTotal, promptUsage(retry.response))
         const retryParsed = parseDecisionFromText(extractText(retryData) ?? "")
         // The retry output is authoritative for the escalation decision: if it
         // parsed, use it; otherwise fall through to the manual-review path.
@@ -411,6 +474,12 @@ export class V1ReviewerBackend {
       )
     } finally {
       if (reviewSessionID !== undefined) {
+        // The host files this session's tokens under the isolation project,
+        // which no usage view reads, so the same tokens are also reported here
+        // as direct usage for the reviewed project. They exist twice in
+        // storage; only this row is visible.
+        if (usageTotal !== undefined)
+          this.reportUsage(reviewSessionID, providerID, modelID, usageTotal)
         if (this.ctx.client.session.abort) {
           await withTimeout(
             this.ctx.client.session.abort({
@@ -431,6 +500,30 @@ export class V1ReviewerBackend {
           ).catch(() => {})
         }
       }
+    }
+  }
+
+  /** Reporting is advisory: it runs once per review and never changes the result. */
+  private reportUsage(
+    reviewSessionID: string,
+    providerID: string,
+    modelID: string,
+    counts: DirectUsageCounts,
+  ): void {
+    try {
+      void this.usage
+        ?.send({
+          pluginID: DIRECT_USAGE_PLUGIN_ID,
+          pluginName: DIRECT_USAGE_PLUGIN_NAME,
+          usageID: reviewSessionID,
+          providerID,
+          modelID,
+          ...(this.config.variant === undefined ? {} : { variant: this.config.variant }),
+          counts,
+        })
+        .catch(() => {})
+    } catch {
+      // A synchronous throw from a custom sender must not reach the review.
     }
   }
 

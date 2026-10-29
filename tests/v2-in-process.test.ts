@@ -698,7 +698,12 @@ test("setup reviews through the plugin context without an HTTP login", async () 
     const isolated = JSON.parse(await readFile(join(directory!, "opencode.json"), "utf8")) as {
       plugins: string[]
     }
-    expect(isolated.plugins).toEqual(["-opencode.config.mcp", "-quartermaster", directory])
+    expect(isolated.plugins).toEqual([
+      "-opencode.config.mcp",
+      "-quartermaster",
+      "-opencode-usage",
+      directory,
+    ])
     expect(await readFile(join(directory, "index.js"), "utf8")).toContain("ctx.mcp.transform")
   } finally {
     http.restore()

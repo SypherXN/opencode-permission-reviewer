@@ -7,6 +7,7 @@ import { DEFAULT_TENANT_POLICY, REVIEWER_SYSTEM_PROMPT } from "../policy.ts"
 import { redactSecrets } from "../redact.ts"
 import { splitModel } from "../config.ts"
 import type { ReviewEnvelope, ReviewExecutionResult, ReviewerConfig } from "../types.ts"
+import type { DirectUsageReporter } from "./direct-usage.ts"
 import {
   OPR_JEV_MODULE,
   interpretCooldownReport,
@@ -123,6 +124,7 @@ export class SystemOneReviewerBackend {
     private readonly modules?: ModuleRoutingClient,
     createInvoke?: (config: ReviewerConfig) => SystemOneInvoke,
     private readonly logger?: ModuleLogger,
+    private readonly usage?: DirectUsageReporter,
   ) {
     this.createInvoke = createInvoke ?? createSystemOneInvoker
   }
@@ -143,6 +145,19 @@ export class SystemOneReviewerBackend {
 
   async waitForIdle(): Promise<void> {
     await Promise.allSettled([...this.jobs])
+  }
+
+  private reportUsage(response: unknown, config: ReviewerConfig, envelope: ReviewEnvelope): void {
+    if (!this.usage) return
+    const failed = (error: unknown) =>
+      this.logger?.("Quartermaster direct usage report failed", { error: String(error) })
+    // Token reporting is not authorization. A broken or slow report must neither
+    // change the decision nor hold it back.
+    try {
+      this.usage.report(response, config.model, envelope.request.id).catch(failed)
+    } catch (error) {
+      failed(error)
+    }
   }
 
   private ensureActive(attempt: ReviewAttempt): void {
@@ -172,6 +187,7 @@ export class SystemOneReviewerBackend {
     attempt: ReviewAttempt,
     escalation: ReasoningEscalation | undefined,
   ): Promise<ReviewExecutionResult> {
+    this.reportUsage(response, config, envelope)
     const parsed = parseSystemOneReview(response, config)
     if (!parsed) {
       const rejection = explainSystemOneRejection(response, config)

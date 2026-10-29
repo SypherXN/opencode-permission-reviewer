@@ -25,7 +25,7 @@ export interface IsolationQueryContext {
 
 const isolationContexts = new Map<string, IsolationQueryContext>()
 
-function locationKey(directory: string): string {
+export function locationKey(directory: string): string {
   const resolved = resolve(directory)
   return process.platform === "win32" ? resolved.toLowerCase() : resolved
 }

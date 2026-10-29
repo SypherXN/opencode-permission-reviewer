@@ -18,15 +18,27 @@ import { enforceDecision, parseDecision, parseDecisionFromText } from "../../dec
 import { applyEscalationDisposition } from "../../escalation.ts"
 import { formatFailureReason } from "../../failure-reason.ts"
 import { DEFAULT_CONFIG, splitModel } from "../../config.ts"
+import { redactSecrets } from "../../redact.ts"
 import { sameIsolationDirectory } from "./in-process-client.ts"
 import { createIsolatedLocation } from "./isolated-location.ts"
 import { selectPlanModel } from "./plan-routing.ts"
 import { captureRequestTools } from "./request-diagnostics.ts"
+import {
+  stepUsageReport,
+  type DirectUsageSender,
+  type ReviewerUsageModel,
+} from "../../system-one/direct-usage.ts"
 
 type Context = Parameters<Plugin.Plugin["setup"]>[0]
 const TOOL = "permission_reviewer_result"
 /** Floor for one decision after a reasoning model spends tokens on the trace. */
 const COMPLETION_BUDGET = 16_384
+const DECISION_RECORDED =
+  "The permission review decision is already recorded. Reply with the single word done. Do not call any tool."
+const DECISION_REJECTED =
+  "The permission review decision call was not accepted. Reply with the single word done. Do not call any tool."
+/** Review requests one turn may send. More forced calls than the review loop accepts is ambiguous. */
+const TURN_STEPS = 3
 
 function toolName(tool: unknown): string | undefined {
   if (typeof tool !== "object" || tool === null) return
@@ -47,6 +59,18 @@ export function forceReviewerCompletion(value: unknown): Record<string, unknown>
   const chat = tools.some(
     (tool) => typeof tool === "object" && tool !== null && "function" in tool,
   )
+  // Anthropic, Google, and other wire formats name these fields differently and
+  // reject OpenAI ones, so only the two OpenAI shapes are rewritten.
+  const responses =
+    !chat &&
+    tools.some(
+      (tool) =>
+        typeof tool === "object" &&
+        tool !== null &&
+        (tool as Record<string, unknown>).type === "function" &&
+        typeof (tool as Record<string, unknown>).name === "string",
+    )
+  if (!chat && !responses) return
   const raise = (key: string) => {
     const current = body[key]
     if (typeof current === "number" && Number.isFinite(current) && current >= COMPLETION_BUDGET) return
@@ -59,8 +83,22 @@ export function forceReviewerCompletion(value: unknown): Record<string, unknown>
   } else {
     raise("max_output_tokens")
     body.tool_choice = { type: "function", name: TOOL }
+    body.parallel_tool_calls = false
   }
   return body
+}
+
+/**
+ * The host sends OpenAI Responses requests over the session WebSocket, where
+ * the HTTP hook never runs. The output cap already comes from the context hook;
+ * this requires the decision tool and one call on the outbound socket frame.
+ */
+export function forceReviewerFrame(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return
+  const frame = value as Record<string, unknown>
+  if (frame.type !== "response.create" || !Array.isArray(frame.tools)) return
+  if (!frame.tools.some((tool) => toolName(tool) === TOOL)) return
+  return { ...frame, tool_choice: { type: "function", name: TOOL }, parallel_tool_calls: false }
 }
 const resultSchema = z
   .object({
@@ -80,7 +118,11 @@ interface PendingGeneration {
   prompt: string
   structured: boolean
   results: ReviewDecision[]
+  /** Review requests built in the current turn. */
+  steps: number
   closing?: boolean
+  /** Set after a provider error, so a provider that rejects a forced tool choice can still answer. */
+  unforced?: boolean
 }
 
 interface ReviewerLocation {
@@ -108,8 +150,95 @@ function sessionNotFoundTag(tag: unknown): boolean {
   return tag === "SessionNotFoundError" || tag === "Session.NotFoundError"
 }
 
-function sameDecision(left: ReviewDecision, right: ReviewDecision): boolean {
-  return JSON.stringify(left) === JSON.stringify(right)
+/**
+ * Calls that agree on the outcome and every classification are one decision,
+ * even when the rationale is worded differently. The lowest confidence stands.
+ * Any disagreement is ambiguous.
+ */
+function agreedDecision(
+  decisions: readonly ReviewDecision[],
+): ReviewDecision | "ambiguous" | undefined {
+  const first = decisions[0]
+  if (!first) return
+  let confidence = first.confidence
+  for (const item of decisions) {
+    if (
+      item.outcome !== first.outcome ||
+      item.risk_level !== first.risk_level ||
+      item.user_authorization !== first.user_authorization ||
+      item.scope_alignment !== first.scope_alignment ||
+      item.evidence_completeness !== first.evidence_completeness
+    )
+      return "ambiguous"
+    confidence = Math.min(confidence, item.confidence)
+  }
+  return { ...first, confidence }
+}
+
+function field(value: unknown, key: string): unknown {
+  return typeof value === "object" && value !== null
+    ? (value as Record<string, unknown>)[key]
+    : undefined
+}
+
+/** Whether the model already made a tool call after the latest user message. */
+function calledThisTurn(messages: readonly unknown[]): boolean {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    if (field(message, "role") === "user") return false
+    const content = field(message, "content")
+    if (Array.isArray(content) && content.some((part) => field(part, "type") === "tool-call"))
+      return true
+  }
+  return false
+}
+
+/** Provider failure recorded on a reviewer reply, without the response body. */
+function providerFault(response: readonly unknown[]): string | undefined {
+  for (const message of response) {
+    const error = field(message, "error")
+    if (typeof error !== "object" || error === null) continue
+    const status = field(error, "status")
+    const type = field(error, "type")
+    const label = [
+      typeof status === "number" ? String(status) : "",
+      typeof type === "string" ? type : "",
+    ]
+      .filter(Boolean)
+      .join(" ")
+    const detail = field(error, "message")
+    const text = typeof detail === "string" && detail.trim() ? detail.trim() : "no message"
+    return redactSecrets(`provider error${label ? ` ${label}` : ""}: ${text}`).slice(0, 240)
+  }
+}
+
+/** One short reason this turn produced no decision, for the audit log and the rejection. */
+function attemptFault(input: {
+  response: readonly unknown[]
+  matched: boolean
+  stored: number
+  conflict: boolean
+  toolCalls: number
+  foreign: boolean
+  text: string
+}): string {
+  const provider = providerFault(input.response)
+  if (provider) return provider
+  if (!input.matched)
+    return input.stored > 0
+      ? "a stored decision has no matching prompt in the review session"
+      : "the review session has no reply to this prompt"
+  if (input.conflict) {
+    if (input.foreign) return "the reviewer called a tool other than the decision tool"
+    if (input.toolCalls > 3) return `too many decision calls (${input.toolCalls})`
+    return `decision calls disagree (${Math.max(input.stored, input.toolCalls)} calls)`
+  }
+  if (input.toolCalls > 0) return "the decision call had invalid arguments"
+  const finish = field(input.response[input.response.length - 1], "finish")
+  const ending = typeof finish === "string" ? finish : "unknown"
+  return input.text.trim()
+    ? `no decision call; the reply was text (finish: ${ending})`
+    : `no decision call and no reply text (finish: ${ending})`
 }
 
 /**
@@ -134,18 +263,13 @@ function recoveredToolDecision(
   const decisions: ReviewDecision[] = []
   for (const part of parts) {
     if (part.name !== TOOL) return "ambiguous"
-    const status = part.state?.status
-    // A finished review can still be "streaming" when the provider closed the
-    // turn before the host marked the tool completed. The arguments are the decision.
-    if (status !== "error" && status !== "completed" && status !== "streaming") return
+    // The host status is settlement bookkeeping. The arguments are the decision
+    // whether the label is streaming, running, completed, or a later name.
     const decision = parseDecision(toolArguments(part.state?.input))
     if (!decision) return
     decisions.push(decision)
   }
-  const first = decisions[0]
-  if (!first) return
-  if (decisions.some((item) => !sameDecision(item, first))) return "ambiguous"
-  return first
+  return agreedDecision(decisions)
 }
 
 function sessionGone(error: unknown): boolean {
@@ -163,6 +287,21 @@ function sessionGone(error: unknown): boolean {
   return visit(error)
 }
 
+/** How long a finished review still accepts its step usage events. */
+const USAGE_GRACE_MS = 60_000
+
+/**
+ * Every project's backend hooks into the one shared isolation instance, so each
+ * hook sees every project's review sessions. A session belongs to the backend
+ * that created it, and the other backends must leave it alone.
+ */
+const OWNERS = Symbol.for("opencode-permission-reviewer.reviewer-session-owners")
+const ownerGlobals = globalThis as typeof globalThis & {
+  [OWNERS]: Map<string, V2ReviewerBackend> | undefined
+}
+const owners = ownerGlobals[OWNERS] ?? new Map<string, V2ReviewerBackend>()
+ownerGlobals[OWNERS] = owners
+
 /** Owns auxiliary sessions and host hooks, never operational permission replies. */
 export class V2ReviewerBackend {
   private readonly sessions = new Map<string, PendingGeneration>()
@@ -175,13 +314,85 @@ export class V2ReviewerBackend {
   private locationGate: Promise<void> = Promise.resolve()
   private disposal?: Promise<void>
   private closing = false
+  /** A step event can arrive after its review returns, so the model outlives the session. */
+  private readonly usageModels = new Map<string, ReviewerUsageModel>()
   constructor(
     private readonly ctx: Context,
     private readonly config: ReviewerConfig,
+    private readonly usage?: DirectUsageSender,
   ) {}
 
   owns(sessionID: string): boolean {
     return this.sessions.has(sessionID) || this.retained.has(sessionID)
+  }
+
+  /** Another project's backend created this session in the shared isolation instance. */
+  private foreign(sessionID: string): boolean {
+    const owner = owners.get(sessionID)
+    return owner !== undefined && owner !== this
+  }
+
+  /** The host offers one decision tool per name, so it may run another backend's definition. */
+  private decide(input: unknown, sessionID: string): { content: string } {
+    const pending = this.sessions.get(sessionID)
+    if (
+      this.retained.has(sessionID) ||
+      !pending?.attempt.active() ||
+      pending.closing ||
+      !pending.structured
+    )
+      throw new Error("Not an active structured reviewer session")
+    const decision = parseDecision(input)
+    if (!decision) throw new Error("Invalid review decision")
+    pending.results.push(decision)
+    if (agreedDecision(pending.results) === "ambiguous")
+      throw new Error("Conflicting review decisions are ambiguous")
+    return { content: "Decision captured. Finish without further actions." }
+  }
+
+  /** Only an undecided structured review's own model request is forced to call the tool. */
+  private forcing(sessionID: string, kind: string): boolean {
+    const pending = this.sessions.get(sessionID)
+    return (
+      kind === "primary" &&
+      !this.retained.has(sessionID) &&
+      pending !== undefined &&
+      pending.attempt.active() &&
+      !pending.closing &&
+      pending.structured &&
+      !pending.unforced &&
+      pending.results.length === 0
+    )
+  }
+
+  /** Quartermaster is kept out of the isolation folder, so it never sees these steps. */
+  private async collectUsage(events: AsyncIterable<unknown>, signal: AbortSignal): Promise<void> {
+    const iterator = events[Symbol.asyncIterator]()
+    // Race the host's stream against the abort signal: a stream that never
+    // ends must not keep this loop, or its listeners, alive after disposal.
+    const stopped = new Promise<IteratorResult<unknown>>((resolve) => {
+      if (signal.aborted) resolve({ done: true, value: undefined })
+      else
+        signal.addEventListener("abort", () => resolve({ done: true, value: undefined }), {
+          once: true,
+        })
+    })
+    try {
+      for (;;) {
+        if (signal.aborted) return
+        const next = await Promise.race([iterator.next(), stopped])
+        if (next.done) return
+        const report = stepUsageReport(next.value, (sessionID) => this.usageModels.get(sessionID))
+        if (report) void this.usage?.send(report).catch(() => {})
+      }
+    } catch {
+      // Usage is advisory. A closed stream must not reach a review.
+    } finally {
+      // Nothing awaits this task, so a close that throws or rejects would go unhandled.
+      Promise.resolve()
+        .then(() => iterator.return?.())
+        .catch(() => {})
+    }
   }
 
   async register(ctx: Context = this.ctx): Promise<() => Promise<void>> {
@@ -195,27 +406,15 @@ export class V2ReviewerBackend {
               "Return exactly one final permission review decision matching the required schema.",
             options: { codemode: false, permission: TOOL },
             input: resultSchema,
-            execute: async (input, execution) => {
-              const pending = this.sessions.get(execution.sessionID)
-              if (
-                this.retained.has(execution.sessionID) ||
-                !pending?.attempt.active() ||
-                pending.closing ||
-                !pending.structured
-              )
-                throw new Error("Not an active structured reviewer session")
-              const decision = parseDecision(input)
-              if (!decision) throw new Error("Invalid review decision")
-              pending.results.push(decision)
-              if (pending.results.length > 1)
-                throw new Error("Multiple review decisions are ambiguous")
-              return { content: "Decision captured. Finish without further actions." }
-            },
+            execute: async (input, execution) =>
+              (owners.get(execution.sessionID) ?? this).decide(input, execution.sessionID),
           }),
         ),
       )
       registrations.push(
         await ctx.session.hook("context", (event) => {
+          // Deleting the tool below would strip it from another project's review.
+          if (this.foreign(event.sessionID)) return
           const pending = this.sessions.get(event.sessionID)
           if (this.retained.has(event.sessionID)) throw new Error("Review no longer active")
           if (!pending) {
@@ -224,6 +423,27 @@ export class V2ReviewerBackend {
           }
           if (pending.closing || !pending.attempt.active())
             throw new Error("Review no longer active")
+          // The host runs another step after every tool call. Rebuilding the review
+          // prompt there asks for a second, independent decision that can disagree.
+          if (pending.structured && pending.results.length > 0) {
+            event.system = [{ type: "text", text: DECISION_RECORDED }]
+            event.messages = [{ role: "user", content: [{ type: "text", text: DECISION_RECORDED }] }]
+            event.tools = {}
+            return
+          }
+          // The rebuilt prompt hides a rejected call's error, so a forced call in the
+          // same turn repeats it. Closing the turn leaves recovery and retry to the
+          // review loop.
+          if (
+            pending.structured &&
+            (calledThisTurn(event.messages) || pending.steps >= TURN_STEPS)
+          ) {
+            event.system = [{ type: "text", text: DECISION_REJECTED }]
+            event.messages = [{ role: "user", content: [{ type: "text", text: DECISION_REJECTED }] }]
+            event.tools = {}
+            return
+          }
+          pending.steps++
           event.system = [
             {
               type: "text",
@@ -253,15 +473,7 @@ export class V2ReviewerBackend {
       )
       registrations.push(
         await ctx.session.hook("http.request", async (event) => {
-          const pending = this.sessions.get(event.sessionID)
-          if (
-            event.kind !== "primary" ||
-            this.retained.has(event.sessionID) ||
-            !pending?.attempt.active() ||
-            pending.closing ||
-            !pending.structured
-          )
-            return
+          if (!this.forcing(event.sessionID, event.kind)) return
           let parsed: unknown
           try {
             parsed = JSON.parse(await event.request.clone().text())
@@ -279,6 +491,23 @@ export class V2ReviewerBackend {
           })
         }),
       )
+      try {
+        registrations.push(
+          await ctx.session.hook("experimental.ws.send", (event) => {
+            if (!this.forcing(event.sessionID, event.kind)) return
+            let parsed: unknown
+            try {
+              parsed = JSON.parse(event.frame)
+            } catch {
+              return
+            }
+            const frame = forceReviewerFrame(parsed)
+            if (frame) event.frame = JSON.stringify(frame)
+          }),
+        )
+      } catch {
+        // A host without socket hooks still sends HTTP requests through the hook above.
+      }
       if (this.config.debug) {
         registrations.push(
           await ctx.session.hook("http.request", async (event) => {
@@ -297,6 +526,23 @@ export class V2ReviewerBackend {
             )
           }),
         )
+      }
+      if (this.usage && typeof ctx.event?.subscribe === "function") {
+        try {
+          const controller = new AbortController()
+          // Nothing may await this task. A host stream that ignores the abort
+          // signal would leave dispose() pending forever, and the host would
+          // never finish setting up the next instance, which then has no
+          // decision tool at all.
+          void this.collectUsage(
+            ctx.event.subscribe({ signal: controller.signal }),
+            controller.signal,
+          ).catch(() => {})
+          registrations.push({ dispose: async () => controller.abort() })
+        } catch {
+          // Usage reporting is advisory. A host that refuses this subscription
+          // must still get the decision tool, prompt, and tool guard below.
+        }
       }
       registrations.push(
         await ctx.tool.hook("execute.before", (event) => {
@@ -482,8 +728,11 @@ export class V2ReviewerBackend {
         ),
         structured: this.config.outputFormat === "json_schema",
         results: [],
+        steps: 0,
       }
       this.sessions.set(id, pending)
+      owners.set(id, this)
+      if (this.usage) this.usageModels.set(id, { providerID, modelID, ...(variant ? { variant } : {}) })
       createIssued = true
       const created = await attempt.wait(
         client.session.create(
@@ -509,8 +758,10 @@ export class V2ReviewerBackend {
       if (created.id !== id || created.location.directory !== directory)
         throw new Error("Reviewer session identity or isolation location does not match")
       const tries = pending.structured ? 3 : 2
+      let fault = "no review turn completed"
       for (let index = 0; index < tries; index++) {
         pending.results = []
+        pending.steps = 0
         const signal = AbortSignal.any([attempt.signal, AbortSignal.timeout(this.config.timeoutMs)])
         const admitted = await attempt.wait(
           client.session.prompt({ sessionID: id, text: pending.prompt }, { signal }),
@@ -523,17 +774,9 @@ export class V2ReviewerBackend {
         const response = messages
           .slice(userIndex < 0 ? messages.length : userIndex + 1)
           .filter((message) => message.type === "assistant")
-        const toolMessages = response
-          .map((message) => message.content.filter((part) => part.type === "tool"))
-          .filter((parts) => parts.length > 0)
-        const toolParts = toolMessages.flat()
-        const finalTool = toolParts.at(-1)
-        const boundedSchemaRetries =
-          toolMessages.every((parts) => parts.length === 1) &&
-          toolParts.length <= 3 &&
-          toolParts
-            .slice(0, -1)
-            .every((part) => part.name === TOOL && part.state.status === "error")
+        const toolParts = response.flatMap((message) =>
+          message.content.filter((part) => part.type === "tool"),
+        )
         const text = response
           .flatMap((message) =>
             message.content.filter((part) => part.type === "text").map((part) => part.text),
@@ -545,21 +788,23 @@ export class V2ReviewerBackend {
           )
           .join("\n")
         const recovered = pending.structured ? recoveredToolDecision(toolParts) : undefined
+        // Decisions captured for this prompt are the decision when they agree. The
+        // host's tool label is not. Disagreeing calls, or a stored decision with no
+        // matching prompt in the transcript, still fail closed.
+        const stored = agreedDecision(pending.results)
         const ambiguous =
-          pending.results.length > 1 ||
+          stored === "ambiguous" ||
           recovered === "ambiguous" ||
-          (pending.results.length === 1 &&
+          (stored !== undefined &&
             (userIndex < 0 ||
-              !boundedSchemaRetries ||
-              finalTool?.name !== TOOL ||
-              finalTool?.state.status !== "completed"))
+              (recovered !== undefined && agreedDecision([stored, recovered]) === "ambiguous")))
         // A schema rejection still carries the model's arguments. One agreement
         // across those calls is the decision. Text is only read when the model
         // did not call the tool, and only as one complete JSON object.
         let parsed: ReviewDecision | undefined
         if (!pending.structured) parsed = parseDecisionFromText(text)
-        else if (!ambiguous && pending.results.length === 1) parsed = pending.results[0]
-        else if (!ambiguous && pending.results.length === 0 && recovered !== "ambiguous") {
+        else if (!ambiguous && stored !== undefined) parsed = stored
+        else if (!ambiguous && pending.results.length === 0) {
           parsed =
             recovered ?? (toolParts.length === 0 ? parseDecisionFromText(text) : undefined)
         }
@@ -572,14 +817,24 @@ export class V2ReviewerBackend {
           text.trim().length === 0
         )
           parsed = parseDecisionFromText(reasoning)
-        if (ambiguous) break
-        if (parsed)
+        if (parsed && !ambiguous)
           return {
             ...enforceDecision(parsed, this.config),
             reviewSessionID: id,
             decisionSource: "llm-reviewer",
             reviewerModel: `${providerID}/${modelID}`,
           }
+        fault = attemptFault({
+          response,
+          matched: userIndex >= 0,
+          stored: pending.results.length,
+          conflict: ambiguous,
+          toolCalls: toolParts.length,
+          foreign: toolParts.some((part) => part.name !== TOOL),
+          text,
+        })
+        if (ambiguous) break
+        if (providerFault(response)) pending.unforced = true
         pending.prompt += pending.structured
           ? "\nThe prior response was invalid. Call permission_reviewer_result exactly once with version set to the number 2 and only the required decision fields. Do not answer with prose."
           : "\nThe prior response was invalid. Return exactly one valid decision using the requested format."
@@ -587,7 +842,7 @@ export class V2ReviewerBackend {
       return applyEscalationDisposition(
         {
           kind: "escalate",
-          reason: "Reviewer returned missing, invalid, or ambiguous output.",
+          reason: `Reviewer returned missing, invalid, or ambiguous output: ${fault}.`,
           reviewSessionID: id,
           decisionSource: "failure-safe",
         },
@@ -606,6 +861,8 @@ export class V2ReviewerBackend {
         "reviewer-failure",
       )
     } finally {
+      if (this.usageModels.has(id))
+        setTimeout(() => this.usageModels.delete(id), USAGE_GRACE_MS).unref?.()
       // Keep the tool guard until interruption and deletion have settled.
       const pending = this.sessions.get(id)
       if (pending) pending.closing = true
@@ -654,8 +911,10 @@ export class V2ReviewerBackend {
         // The attempt is finished. An unconfirmed session keeps its tool guard, but it
         // is no longer in-flight, so it cannot block the next review or pin a dead location.
         this.sessions.delete(id)
-        if (cleanupConfirmed || !createIssued) this.retained.delete(id)
-        else this.retained.add(id)
+        if (cleanupConfirmed || !createIssued) {
+          this.retained.delete(id)
+          if (owners.get(id) === this) owners.delete(id)
+        } else this.retained.add(id)
       }
     }
   }

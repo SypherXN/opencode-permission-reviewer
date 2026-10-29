@@ -579,6 +579,15 @@ deny from fail-closed escalate→deny), optional System One escalation origin,
 and a bounded SSH summary. Remote commands
 are stored as **SHA-256**, never in clear text. Set `audit: false` to disable.
 
+Automatic retention removes records older than 24 hours once the oldest is
+an hour past that cutoff. Writers coordinate pruning and appends through
+Bun's SQLite locks in `<auditPath>.lock.sqlite`; no audit records are stored
+there. Leave this sidecar in place while any reviewer is running. Locks are
+released automatically when a writer closes or crashes. Lock waits are bounded
+to five seconds; failures are logged without changing permission decisions.
+A host that loads plugins outside Bun still runs the reviewer, but it writes
+no audit records there.
+
 ## What you'll see
 
 ```text

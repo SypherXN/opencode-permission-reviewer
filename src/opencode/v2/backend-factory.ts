@@ -4,6 +4,10 @@ import type { ReviewAttempt } from "../../core/review-attempt.ts"
 import { isSystemOneReviewerModel } from "../../config.ts"
 import { SystemOneReviewerBackend } from "../../system-one/backend.ts"
 import {
+  createQuartermasterDirectUsageClient,
+  type DirectUsageRpcHost,
+} from "../../system-one/direct-usage.ts"
+import {
   createQuartermasterModuleClient,
   type QuartermasterRpcHost,
 } from "../../system-one/module-routing.ts"
@@ -35,12 +39,19 @@ function escalationConfig(config: ReviewerConfig): ReviewerConfig | undefined {
 }
 
 export function createV2ReviewerBackend(context: Context, config: ReviewerConfig): V2ReviewBackend {
-  if (!isSystemOneReviewerModel(config.model)) return new V2ReviewerBackend(context, config)
-  const secondaryConfig = escalationConfig(config)
-  const secondary = secondaryConfig ? new V2ReviewerBackend(context, secondaryConfig) : undefined
   const logger = config.debug
     ? (message: string, details?: unknown) =>
         console.error(`[opencode-permission-reviewer] ${message}`, details ?? "")
+    : undefined
+  const usage = createQuartermasterDirectUsageClient(
+    context as unknown as DirectUsageRpcHost,
+    undefined,
+    logger,
+  )
+  if (!isSystemOneReviewerModel(config.model)) return new V2ReviewerBackend(context, config, usage)
+  const secondaryConfig = escalationConfig(config)
+  const secondary = secondaryConfig
+    ? new V2ReviewerBackend(context, secondaryConfig, usage)
     : undefined
   const modules = config.moduleRouting
     ? createQuartermasterModuleClient(context as unknown as QuartermasterRpcHost, undefined, logger)
@@ -54,6 +65,7 @@ export function createV2ReviewerBackend(context: Context, config: ReviewerConfig
     modules,
     undefined,
     logger,
+    usage,
   )
   return {
     owns: (sessionID) => secondary?.owns(sessionID) ?? false,
