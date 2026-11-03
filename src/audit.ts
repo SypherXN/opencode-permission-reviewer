@@ -82,15 +82,12 @@ function bump(map: Record<string, number>, key: string): void {
   map[key] = (map[key] ?? 0) + 1
 }
 
-/** Records older than this are removed by the next rewrite. Lines with no
- *  parseable timestamp stay, so a corrupt line is not treated as expired. The
- *  file is append-only between those rewrites. */
-const AUDIT_RETENTION_MS = 24 * 60 * 60 * 1000
-
-/** A rewrite starts only once the oldest record is this far past retention.
- *  Reviews arrive at a steady rate, so at the bare cutoff some record expires
- *  before nearly every append, and each append would copy the whole file. */
-const AUDIT_PRUNE_SLACK_MS = 60 * 60 * 1000
+/** Local midnight for `now`. Retention uses this boundary, not a sliding
+ *  24-hour window, so a rewrite happens on the first append of a new day. */
+function startOfLocalDay(now: number): number {
+  const date = new Date(now)
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime()
+}
 
 /** Cap on how much of an audit file the summary reader will pull into memory.
  *  The writer drops expired records, and the report still only needs the most
@@ -363,8 +360,9 @@ function readAt(fd: number, offset: number, length: number): Buffer {
   return read < length ? buffer.subarray(0, read) : buffer
 }
 
-/** True when the oldest dated record is past the cutoff, or none is found near
- *  the head. An append-only file is oldest-first, so a recent one needs no rewrite. */
+/** True when the oldest dated record is from before the cutoff, or none is
+ *  found near the head. An append-only file is oldest-first, so a record from
+ *  the current local day needs no rewrite. */
 function headNeedsPrune(fd: number, size: number, cutoff: number): boolean {
   const max = Math.min(size, 256 * 1024)
   let carry = Buffer.alloc(0)
@@ -401,8 +399,9 @@ function writeFully(fd: number, data: Buffer, position?: number): void {
   }
 }
 
-/** Copy lines that are still inside the retention window. Expired records are
- *  counted and dropped. Blank lines are not records and are not copied. */
+/** Copy lines from the current local day. Earlier dated records are counted
+ *  and dropped. Blank lines are not records and are not copied. Undated lines
+ *  stay. */
 function writeRetainedLines(input: number, size: number, output: number, cutoff: number): number {
   let offset = 0
   let carry = Buffer.alloc(0)
@@ -521,9 +520,10 @@ function replaceRegularFile(temp: string, path: string): void {
   }
 }
 
-/** Drop records older than 24 hours once the oldest is an hour past that.
- *  Returns how many records were removed. Never follows a symlink. A missing
- *  file removes nothing. */
+/** Drop records from before the start of the current local day. Returns how
+ *  many records were removed. Never follows a symlink. A missing file removes
+ *  nothing. A later call the same day removes nothing, because the oldest
+ *  remaining dated record is already from today. */
 export function pruneExpiredAudit(path: string, now = Date.now()): number {
   try {
     const info = lstatSync(path)
@@ -558,8 +558,8 @@ function pruneAuditLocked(path: string, now: number): number {
     input = openSync(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW)
     const info = fstatSync(input)
     if (!info.isFile() || info.size === 0) return 0
-    const cutoff = now - AUDIT_RETENTION_MS
-    if (!headNeedsPrune(input, info.size, cutoff - AUDIT_PRUNE_SLACK_MS)) return 0
+    const cutoff = startOfLocalDay(now)
+    if (!headNeedsPrune(input, info.size, cutoff)) return 0
     output = openFreshRegularFile(temp)
     removeTemp = true
     const dropped = writeRetainedLines(input, info.size, output, cutoff)
@@ -662,7 +662,7 @@ export function createAuditWriter(
         try {
           try {
             const dropped = pruneAuditLocked(path, Date.now())
-            if (dropped > 0) logger?.("pruned audit records older than 24 hours", { path, dropped })
+            if (dropped > 0) logger?.("pruned audit records from before today", { path, dropped })
           } catch (error) {
             // Retention failure must not discard this record. Still hold the lock.
             logger?.("failed to prune audit records", {

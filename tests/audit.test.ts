@@ -26,6 +26,12 @@ const execFileAsync = (cmd: string, args: string[]) =>
   })
 const repoRoot = join(dirname(import.meta.path), "..")
 
+/** Matches `startOfLocalDay` in src/audit.ts. */
+function startOfLocalDay(now = Date.now()): number {
+  const date = new Date(now)
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime()
+}
+
 function record(overrides: Partial<ReviewAuditRecord> = {}): ReviewAuditRecord {
   return {
     timestamp: new Date().toISOString(),
@@ -508,19 +514,20 @@ console.log(JSON.stringify(logs));`,
     expect(parsed.requestID).toBe("per_x")
   })
 
-  test("drops records older than 24 hours and keeps the recent ones", async () => {
+  test("drops earlier days once and keeps records from the current local day", async () => {
     const auditPath = join(directory, "audit.jsonl")
-    const hour = 60 * 60 * 1000
-    // The oldest record must be an hour past retention before anything is rewritten.
-    const older = new Date(Date.now() - 25 * hour - 60_000).toISOString()
-    const expired = new Date(Date.now() - 24 * hour - 60_000).toISOString()
-    const newer = new Date(Date.now() - 24 * hour + 60_000).toISOString()
+    const dayStart = startOfLocalDay()
+    // One minute before local midnight can be well under 24 hours old. It still
+    // belongs to the previous day, so the daily rewrite removes it.
+    const older = new Date(dayStart - 36 * 60 * 60 * 1000).toISOString()
+    const previousDay = new Date(dayStart - 60_000).toISOString()
+    const today = new Date(dayStart).toISOString()
     const lines = [
       JSON.stringify(record({ requestID: "per_old", timestamp: older })),
-      JSON.stringify(record({ requestID: "per_old_in_slack", timestamp: expired })),
+      JSON.stringify(record({ requestID: "per_previous_day", timestamp: previousDay })),
       "not json",
       JSON.stringify({ requestID: "per_undated", outcome: "allow" }),
-      JSON.stringify(record({ requestID: "per_kept", timestamp: newer })),
+      JSON.stringify(record({ requestID: "per_kept", timestamp: today })),
     ]
     // A few hundred KiB crosses the rewrite's read chunks, including a line
     // that does not end on a chunk boundary.
@@ -546,28 +553,36 @@ console.log(JSON.stringify(logs));`,
     expect(ids).toContain("per_undated")
     expect(ids).toContain("not json")
     expect(ids).toContain("per_new")
+    expect(ids).not.toContain("per_previous_day")
     expect(ids.some((id) => id === "per_old" || id.startsWith("per_old_"))).toBe(false)
     await expect(stat(`${auditPath}.${process.pid}.tmp`)).rejects.toThrow()
+    // The same local day does not rewrite again, even when the temp path cannot be opened.
+    await mkdir(`${auditPath}.${process.pid}.tmp`)
+    expect(pruneExpiredAudit(auditPath)).toBe(0)
   })
 
-  test("no rewrite starts before the oldest record is an hour past retention", async () => {
+  test("no rewrite starts while the oldest dated record is from the current local day", async () => {
     const auditPath = join(directory, "audit.jsonl")
-    const hour = 60 * 60 * 1000
-    const at = (age: number) =>
-      JSON.stringify(
-        record({ requestID: `per_${age}`, timestamp: new Date(Date.now() - age).toISOString() }),
-      )
+    const today = JSON.stringify(
+      record({ requestID: "per_today", timestamp: new Date(startOfLocalDay()).toISOString() }),
+    )
+    const yesterday = JSON.stringify(
+      record({
+        requestID: "per_yesterday",
+        timestamp: new Date(startOfLocalDay() - 60_000).toISOString(),
+      }),
+    )
     // A rewrite opens this temp path, and a directory there makes that open throw.
     await mkdir(`${auditPath}.${process.pid}.tmp`)
     for (const head of [
-      [at(24 * hour + 60_000)],
+      [today],
       // Undated lines survive a rewrite, so they must not trigger one either.
-      ["not json", "", JSON.stringify({ requestID: "per_undated" }), at(hour)],
+      ["not json", "", JSON.stringify({ requestID: "per_undated" }), today],
     ]) {
-      await writeFile(auditPath, `${[...head, at(60_000)].join("\n")}\n`)
+      await writeFile(auditPath, `${head.join("\n")}\n`)
       expect(pruneExpiredAudit(auditPath)).toBe(0)
     }
-    await writeFile(auditPath, `${[at(25 * hour + 60_000), at(60_000)].join("\n")}\n`)
+    await writeFile(auditPath, `${[yesterday, today].join("\n")}\n`)
     expect(() => pruneExpiredAudit(auditPath)).toThrow("not a regular file")
   })
 
