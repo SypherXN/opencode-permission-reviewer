@@ -8,6 +8,7 @@ import type { OpenCodeClient } from "@opencode/client"
 import type { Plugin } from "@opencode/plugin"
 import { createV2ReviewerBackend } from "../src/opencode/v2/backend-factory.ts"
 import {
+  cleanupTiming,
   forceReviewerCompletion,
   forceReviewerFrame,
 } from "../src/opencode/v2/reviewer-backend.ts"
@@ -76,6 +77,14 @@ function fixture(
     providerError?: boolean
     rejectedFollowUp?: boolean
     blindSteps?: number
+    wrongIdentity?: boolean
+    holdCreate?: () => Promise<void> | void
+    cleanupFailures?: number
+    hungCleanup?: boolean
+    /** A cleanup call made before the create answers sees the session as absent. */
+    staleAbsence?: boolean
+    holdCleanupGet?: (call: number) => Promise<void> | void
+    holdCleanupRemove?: (call: number) => Promise<void> | void
   } = {},
 ) {
   let reasked = false
@@ -100,6 +109,10 @@ function fixture(
   let sessionID = ""
   const sessionIDs: string[] = []
   const removed = new Set<string>()
+  const removedIDs: string[] = []
+  let createReturned = false
+  let getCalls = 0
+  let removeCalls = 0
   const messagesBySession = new Map<string, string>()
   const attempts: ReviewAttempt[] = []
   let prompts = 0
@@ -328,8 +341,10 @@ function fixture(
         expect(input.permissions[0]).toEqual({ action: "*", resource: "*", effect: "deny" })
         for (const action of ["read", "shell"])
           expect(input.permissions).not.toContainEqual({ action, resource: "*", effect: "ask" })
+        await options.holdCreate?.()
+        createReturned = true
         return {
-          id: sessionID,
+          id: options.wrongIdentity ? "ses_unexpected" : sessionID,
           agent: "build",
           location: { directory: options.wrongLocation ? "/workspace/operational" : directory },
         }
@@ -612,10 +627,23 @@ function fixture(
       ],
       interrupt: async () => {},
       remove: async ({ sessionID: current }: { sessionID: string }) => {
+        removedIDs.push(current)
+        removeCalls += 1
+        await options.holdCleanupRemove?.(removeCalls)
+        if (options.hungCleanup) return new Promise<void>(() => {})
+        if ((options.cleanupFailures ?? 0) > 0) {
+          options.cleanupFailures! -= 1
+          throw new Error("remove failed")
+        }
+        // A removal attempt made before creation landed must not hide the session.
+        if (options.staleAbsence && !createReturned) return
         removed.add(current)
       },
       get: async ({ sessionID: current }: { sessionID: string }) => {
-        if (removed.has(current)) {
+        getCalls += 1
+        const absent = removed.has(current) || (options.staleAbsence === true && !createReturned)
+        if (absent) {
+          await options.holdCleanupGet?.(getCalls)
           if (options.missingSession === "present") return { id: current }
           if (options.missingSession === "name") {
             throw Object.assign(new Error("SessionNotFoundError: session is gone"), {
@@ -673,12 +701,14 @@ function fixture(
         client,
       )
     },
+    cancel: () => attempts.at(-1)?.close("cancelled"),
     state: () => ({
       directory,
       directories: [...directories],
       sessionID,
       sessionIDs,
       removed: removed.has(sessionID),
+      removedIDs: [...removedIDs],
       requestedVariant,
       requestedModel,
       rpcCalls,
@@ -725,6 +755,33 @@ function fixture(
       else process.env.OPENCODE_PERMISSION_REVIEWER_ISOLATION_DIR = previousIsolationBase
     },
   }
+}
+
+/** Keep the bounded cleanup tests fast without changing the production deadline. */
+async function withFastCleanup<T>(run: () => Promise<T>): Promise<T> {
+  const saved = { ...cleanupTiming }
+  cleanupTiming.deadlineMs = 500
+  cleanupTiming.attemptMs = 100
+  cleanupTiming.retryDelayMs = 10
+  try {
+    return await run()
+  } finally {
+    Object.assign(cleanupTiming, saved)
+  }
+}
+
+/** Wrap the backend's cached location release so a test counts actual releases. */
+async function countCachedReleases(backend: unknown): Promise<() => number> {
+  const state = backend as { locationPromise?: Promise<{ release(): void } | undefined> }
+  const location = await state.locationPromise
+  if (!location) throw new Error("reviewer backend has no cached location")
+  let releases = 0
+  const release = location.release.bind(location)
+  location.release = () => {
+    releases += 1
+    release()
+  }
+  return () => releases
 }
 
 test("isolated structured and text backends preserve scope, variant, and retention", async () => {
@@ -1447,6 +1504,257 @@ test("an unconfirmed reviewer session does not block the next review", async () 
     expect(state.directory).toBe(original)
     expect(state.setups).toBe(2)
     expect(state.sessionIDs).toHaveLength(2)
+    expect(() => harness.guard(stuck)).toThrow("Operational tools")
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("a failed foreground cleanup is retried during disposal and then released", async () => {
+  await withFastCleanup(async () => {
+    const harness = fixture({ cleanupFailures: 2 })
+    try {
+      await expect(harness.run()).rejects.toThrow("cleanup could not be confirmed")
+      const stuck = harness.state().sessionID
+      expect(harness.backend.owns(stuck)).toBe(true)
+      expect(() => harness.guard(stuck)).toThrow("Operational tools")
+      const releases = await countCachedReleases(harness.backend)
+      await harness.backend.dispose()
+      expect(harness.state().removedIDs).toContain(stuck)
+      expect(harness.backend.owns(stuck)).toBe(false)
+      // The dispose retry confirmed cleanup before dispose() reached its own
+      // final release, so the cached location is still released exactly once.
+      expect(releases()).toBe(1)
+    } finally {
+      await harness.cleanup()
+    }
+  })
+})
+
+test("a hung cleanup is bounded and keeps the owner and its guards", async () => {
+  await withFastCleanup(async () => {
+    const harness = fixture({ hungCleanup: true })
+    try {
+      await expect(harness.run()).rejects.toThrow("cleanup could not be confirmed")
+      const stuck = harness.state().sessionID
+      const started = Date.now()
+      await harness.backend.dispose()
+      expect(Date.now() - started).toBeLessThan(2000)
+      expect(harness.backend.owns(stuck)).toBe(true)
+      expect(() => harness.guard(stuck)).toThrow("Operational tools")
+      expect(harness.state().removedIDs).toContain(stuck)
+    } finally {
+      await harness.cleanup()
+    }
+  })
+})
+
+test("a cancelled review deletes a session whose create answers late", async () => {
+  await withFastCleanup(async () => {
+    let arrived!: () => void
+    let release!: () => void
+    const started = new Promise<void>((resolve) => (arrived = resolve))
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    const harness = fixture({
+      holdCreate: () => {
+        arrived()
+        return gate
+      },
+    })
+    try {
+      const settled = harness.run().then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+      await started
+      harness.cancel()
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      const id = harness.state().sessionID
+      expect(harness.backend.owns(id)).toBe(true)
+      release()
+      expect(String(await settled)).toContain("cleanup could not be confirmed")
+      for (let index = 0; index < 100 && harness.backend.owns(id); index++)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      expect(harness.state().removedIDs).toContain(id)
+      expect(harness.state().removed).toBe(true)
+      expect(harness.backend.owns(id)).toBe(false)
+    } finally {
+      release()
+      await harness.cleanup()
+    }
+  })
+})
+
+test("a late confirmation after disposal releases the cached location once", async () => {
+  await withFastCleanup(async () => {
+    let arrived!: () => void
+    let release!: () => void
+    const started = new Promise<void>((resolve) => (arrived = resolve))
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    const harness = fixture({
+      holdCreate: () => {
+        arrived()
+        return gate
+      },
+      // Foreground and disposal each spend two attempts before the create answers.
+      cleanupFailures: 4,
+    })
+    try {
+      const settled = harness.run().then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+      await started
+      harness.cancel()
+      expect(String(await settled)).toContain("cleanup could not be confirmed")
+      const releases = await countCachedReleases(harness.backend)
+      await harness.backend.dispose()
+      const id = harness.state().sessionID
+      expect(harness.backend.owns(id)).toBe(true)
+      expect(releases()).toBe(0)
+      release()
+      for (let index = 0; index < 100 && harness.backend.owns(id); index++)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      expect(harness.state().removed).toBe(true)
+      expect(harness.backend.owns(id)).toBe(false)
+      // Only the late confirmation released the location dispose() had kept.
+      expect(releases()).toBe(1)
+    } finally {
+      release()
+      await harness.cleanup()
+    }
+  })
+})
+
+test("a stale NotFound issued before create settlement cannot confirm cleanup", async () => {
+  await withFastCleanup(async () => {
+    let created!: () => void
+    let releaseCreate!: () => void
+    let staleGetStarted!: () => void
+    let releaseStaleGet!: () => void
+    let retryRemoveStarted!: () => void
+    let releaseRetryRemove!: () => void
+    const createStarted = new Promise<void>((resolve) => (created = resolve))
+    const createGate = new Promise<void>((resolve) => (releaseCreate = resolve))
+    const staleGetReady = new Promise<void>((resolve) => (staleGetStarted = resolve))
+    const staleGetGate = new Promise<void>((resolve) => (releaseStaleGet = resolve))
+    const retryRemoveReady = new Promise<void>((resolve) => (retryRemoveStarted = resolve))
+    const retryRemoveGate = new Promise<void>((resolve) => (releaseRetryRemove = resolve))
+    const harness = fixture({
+      staleAbsence: true,
+      holdCreate: () => {
+        created()
+        return createGate
+      },
+      holdCleanupGet: (call) => {
+        if (call !== 1) return
+        staleGetStarted()
+        return staleGetGate
+      },
+      holdCleanupRemove: (call) => {
+        if (call !== 2) return
+        retryRemoveStarted()
+        return retryRemoveGate
+      },
+    })
+    try {
+      const review = harness.run().then(
+        (result) => result,
+        (error: unknown) => error,
+      )
+      await createStarted
+      const id = harness.state().sessionID
+      harness.cancel()
+      await staleGetReady
+      // The first cleanup's absence answer is already pending, before creation lands.
+      releaseCreate()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      releaseStaleGet()
+      // A stale answer must not end ownership; the next attempt has to remove it.
+      const retried = await Promise.race([
+        retryRemoveReady.then(() => true),
+        (async () => {
+          for (let index = 0; index < 100 && harness.backend.owns(id); index++)
+            await new Promise((resolve) => setTimeout(resolve, 5))
+          return false
+        })(),
+      ])
+      expect(retried).toBe(true)
+      expect(harness.backend.owns(id)).toBe(true)
+      expect(() => harness.guard(id)).toThrow("Operational tools")
+      releaseRetryRemove()
+      await review
+      expect(harness.state().removed).toBe(true)
+      expect(harness.backend.owns(id)).toBe(false)
+    } finally {
+      releaseCreate()
+      releaseStaleGet()
+      releaseRetryRemove()
+      await harness.cleanup()
+    }
+  })
+})
+
+test("a retained session waits for a pending create before confirming cleanup", async () => {
+  await withFastCleanup(async () => {
+    let arrived!: () => void
+    let release!: () => void
+    const started = new Promise<void>((resolve) => (arrived = resolve))
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    const harness = fixture({
+      retain: true,
+      holdCreate: () => {
+        arrived()
+        return gate
+      },
+    })
+    try {
+      const settled = harness.run().then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+      await started
+      harness.cancel()
+      expect(String(await settled)).toContain("cleanup could not be confirmed")
+      const id = harness.state().sessionID
+      expect(harness.backend.owns(id)).toBe(true)
+      expect(() => harness.guard(id)).toThrow("Operational tools")
+      release()
+      for (let index = 0; index < 100 && harness.backend.owns(id); index++)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      // The late settlement confirms the interruption without deleting a retained session.
+      expect(harness.backend.owns(id)).toBe(false)
+      expect(harness.state().removedIDs).toEqual([])
+    } finally {
+      release()
+      await harness.cleanup()
+    }
+  })
+})
+
+test("an unexpected session identity is never prompted or deleted", async () => {
+  const harness = fixture({ wrongIdentity: true })
+  try {
+    const result = await harness.run()
+    expect(result.kind).toBe("escalate")
+    expect(result.reason).toContain("identity or isolation location does not match")
+    const state = harness.state()
+    expect(state.prompts).toBe(0)
+    expect(state.removedIDs).toEqual([state.sessionID])
+    expect(state.removedIDs).not.toContain("ses_unexpected")
+    expect(harness.backend.owns("ses_unexpected")).toBe(false)
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("a reload after disposal reinstalls guards for a retained session", async () => {
+  const harness = fixture({ missingSession: "present" })
+  try {
+    await expect(harness.run()).rejects.toThrow("cleanup could not be confirmed")
+    const stuck = harness.state().sessionID
+    await harness.backend.dispose()
+    await harness.reload()
     expect(() => harness.guard(stuck)).toThrow("Operational tools")
   } finally {
     await harness.cleanup()

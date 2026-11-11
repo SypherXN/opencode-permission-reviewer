@@ -196,7 +196,10 @@ tools remain blocked from execution and are removed from the reviewer context,
 including `read` and `shell`. Only the structured decision-result tool is retained
 when required by the output format.
 `retainReviewSessions: false` removes the auxiliary
-session; `true` keeps it for inspection. `reviewBudgetMs` bounds the whole
+session; `true` keeps it for inspection. V2 retries cleanup after transient
+failures, late session creation, and during backend shutdown. Unconfirmed
+cleanup fails closed and keeps isolation guards active. This does not reclaim
+orphaned sessions from earlier processes or crashes. `reviewBudgetMs` bounds the whole
 review; by default it is `2 * timeoutMs + 60000`. Retries consume this budget.
 
 ## Choosing the reviewer model

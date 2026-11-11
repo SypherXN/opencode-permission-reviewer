@@ -19,7 +19,7 @@ import { applyEscalationDisposition } from "../../escalation.ts"
 import { formatFailureReason } from "../../failure-reason.ts"
 import { DEFAULT_CONFIG, splitModel } from "../../config.ts"
 import { redactSecrets } from "../../redact.ts"
-import { sameIsolationDirectory } from "./in-process-client.ts"
+import { releaseInProcessSession, sameIsolationDirectory } from "./in-process-client.ts"
 import { createIsolatedLocation } from "./isolated-location.ts"
 import { selectPlanModel } from "./plan-routing.ts"
 import { captureRequestTools } from "./request-diagnostics.ts"
@@ -129,6 +129,47 @@ interface ReviewerLocation {
   directory: string
   dispose(): Promise<void>
   release(): void
+}
+
+/** State needed to finish one session's cleanup, including a create still in flight. */
+interface CleanupRecord {
+  directory: string
+  client: OpenCodeClient
+  /** The create call settled, so a missing session can be proof of deletion. */
+  createSettled: boolean
+  /** Review cleanup started; a late create answer must retry it. */
+  cleanupEntered: boolean
+  /** Coalesces concurrent cleanup for one session ID. */
+  cleanup: Promise<boolean> | undefined
+  /** Last cleanup failure, kept for the fail-closed rejection. */
+  fault?: string
+}
+
+/** @internal Cleanup bounds. Tests shrink them; production keeps the documented deadline. */
+export const cleanupTiming = { deadlineMs: 8_000, attemptMs: 2_000, retryDelayMs: 250 }
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, Math.max(0, ms))
+    timer.unref?.()
+  })
+}
+
+/** Wait for a host call that may ignore its abort signal. */
+async function bounded<T>(operation: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error("Reviewer cleanup call exceeded its time budget")),
+      Math.max(1, ms),
+    )
+    timer.unref?.()
+  })
+  try {
+    return await Promise.race([operation, timeout])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 function errorMark(error: unknown): string {
@@ -305,12 +346,13 @@ ownerGlobals[OWNERS] = owners
 /** Owns auxiliary sessions and host hooks, never operational permission replies. */
 export class V2ReviewerBackend {
   private readonly sessions = new Map<string, PendingGeneration>()
-  /** Finished reviews whose deletion could not be confirmed. They keep tool guards
+  /** Sessions still needing cleanup. Unconfirmed ones keep their tool guards
    *  without counting as in-flight work. */
-  private readonly retained = new Set<string>()
+  private readonly cleanupRecords = new Map<string, CleanupRecord>()
   private readonly jobs = new Set<Promise<ReviewExecutionResult>>()
   private readonly locationAbort = new AbortController()
   private locationPromise: Promise<ReviewerLocation> | undefined
+  private locationRelease: Promise<void> | undefined
   private locationGate: Promise<void> = Promise.resolve()
   private disposal?: Promise<void>
   private closing = false
@@ -323,7 +365,14 @@ export class V2ReviewerBackend {
   ) {}
 
   owns(sessionID: string): boolean {
-    return this.sessions.has(sessionID) || this.retained.has(sessionID)
+    return this.sessions.has(sessionID) || this.cleanupRecords.has(sessionID)
+  }
+
+  /** A finished or uncertain review keeps its tool guard but is no longer in flight. */
+  private guarded(sessionID: string): boolean {
+    if (!this.cleanupRecords.has(sessionID)) return false
+    const pending = this.sessions.get(sessionID)
+    return !pending || pending.closing === true
   }
 
   /** Another project's backend created this session in the shared isolation instance. */
@@ -335,12 +384,7 @@ export class V2ReviewerBackend {
   /** The host offers one decision tool per name, so it may run another backend's definition. */
   private decide(input: unknown, sessionID: string): { content: string } {
     const pending = this.sessions.get(sessionID)
-    if (
-      this.retained.has(sessionID) ||
-      !pending?.attempt.active() ||
-      pending.closing ||
-      !pending.structured
-    )
+    if (!pending?.attempt.active() || pending.closing || !pending.structured)
       throw new Error("Not an active structured reviewer session")
     const decision = parseDecision(input)
     if (!decision) throw new Error("Invalid review decision")
@@ -355,7 +399,6 @@ export class V2ReviewerBackend {
     const pending = this.sessions.get(sessionID)
     return (
       kind === "primary" &&
-      !this.retained.has(sessionID) &&
       pending !== undefined &&
       pending.attempt.active() &&
       !pending.closing &&
@@ -416,7 +459,7 @@ export class V2ReviewerBackend {
           // Deleting the tool below would strip it from another project's review.
           if (this.foreign(event.sessionID)) return
           const pending = this.sessions.get(event.sessionID)
-          if (this.retained.has(event.sessionID)) throw new Error("Review no longer active")
+          if (this.guarded(event.sessionID)) throw new Error("Review no longer active")
           if (!pending) {
             delete event.tools[TOOL]
             return
@@ -512,7 +555,7 @@ export class V2ReviewerBackend {
         registrations.push(
           await ctx.session.hook("http.request", async (event) => {
             const pending = this.sessions.get(event.sessionID)
-            if (this.retained.has(event.sessionID) || !pending?.attempt.active() || pending.closing)
+            if (this.guarded(event.sessionID) || !pending?.attempt.active() || pending.closing)
               return
             const capture = await captureRequestTools(event.request)
             console.error(
@@ -548,7 +591,7 @@ export class V2ReviewerBackend {
         await ctx.tool.hook("execute.before", (event) => {
           const pending = this.sessions.get(event.sessionID)
           if (
-            this.retained.has(event.sessionID) ||
+            this.guarded(event.sessionID) ||
             (pending && (pending.closing || event.tool !== TOOL))
           ) {
             throw new Error("Operational tools are disabled in reviewer sessions")
@@ -586,16 +629,40 @@ export class V2ReviewerBackend {
     this.locationAbort.abort(new Error("Reviewer backend is shutting down"))
     this.disposal = (async () => {
       await this.waitForIdle()
-      const location = await this.locationPromise?.catch(() => undefined)
+      if (this.cleanupRecords.size > 0) {
+        // Retry retained records under one shutdown deadline, not one per record.
+        const deadline = Date.now() + cleanupTiming.deadlineMs
+        await Promise.allSettled(
+          [...this.cleanupRecords].map(([id, record]) => this.cleanupSession(id, record, deadline)),
+        )
+      }
+      await this.releaseLocation()
+    })()
+    return this.disposal
+  }
+
+  /** Dispose and release the cached location once nothing owns it any more.
+   *  A cleanup that finishes after disposal uses this same idempotent release. */
+  private releaseLocation(): Promise<void> {
+    if (this.locationRelease) return this.locationRelease
+    const run = (async () => {
       // An uncertain session deletion must retain the guards in its cached location.
-      if (!location || this.sessions.size > 0 || this.retained.size > 0) return
+      if (!this.closing || this.sessions.size > 0 || this.cleanupRecords.size > 0) return
+      const location = await this.locationPromise?.catch(() => undefined)
+      if (!location) return
+      // Claim the cached location once. A cleanup that confirms during disposal
+      // may release it before dispose() reaches its own final release.
+      this.locationPromise = undefined
       try {
         await location.dispose()
       } finally {
         location.release()
       }
-    })()
-    return this.disposal
+    })().finally(() => {
+      if (this.locationRelease === run) this.locationRelease = undefined
+    })
+    this.locationRelease = run
+    return run
   }
 
   private ensureLocation(client: OpenCodeClient): Promise<ReviewerLocation> {
@@ -632,6 +699,7 @@ export class V2ReviewerBackend {
   }
 
   private rememberLocation(client: OpenCodeClient): Promise<ReviewerLocation> {
+    this.locationRelease = undefined
     const location = this.openLocation(client)
     this.locationPromise = location
     void location.catch(() => {
@@ -650,14 +718,18 @@ export class V2ReviewerBackend {
       if (failed) throw failed.reason
     }
     const isolated = await createIsolatedLocation(async (context) => {
-      if (this.closing) return async () => {}
+      // After disposal only a retained review still needs its guards.
+      if (this.closing && this.sessions.size === 0 && this.cleanupRecords.size === 0)
+        return async () => {}
       const cleanup = await this.register(context)
       const registration = async () => {
         if (!registrations.delete(registration)) return
         await cleanup()
       }
       registrations.add(registration)
-      if (this.closing) await registration()
+      // Ownership can end while the hooks are being registered.
+      if (this.closing && this.sessions.size === 0 && this.cleanupRecords.size === 0)
+        await registration()
       return registration
     })
     try {
@@ -683,7 +755,6 @@ export class V2ReviewerBackend {
     client: OpenCodeClient,
   ): Promise<ReviewExecutionResult> {
     const id = `ses_${randomBytes(16).toString("hex")}`
-    let createIssued = false
     try {
       if (this.config.planRoutingRejected) throw new Error("Trusted planRouting config is invalid")
       const selection: { providerID: string; modelID: string; variant?: string } = this.config
@@ -733,29 +804,50 @@ export class V2ReviewerBackend {
       this.sessions.set(id, pending)
       owners.set(id, this)
       if (this.usage) this.usageModels.set(id, { providerID, modelID, ...(variant ? { variant } : {}) })
-      createIssued = true
-      const created = await attempt.wait(
-        client.session.create(
-          {
-            id,
-            title: "Permission review",
-            location: { directory },
-            model: {
-              id: modelID,
-              providerID,
-              ...(variant ? { variant } : {}),
-            },
-            permissions: [
-              { action: "*", resource: "*", effect: "deny" },
-              ...(pending.structured
-                ? [{ action: TOOL, resource: "*", effect: "allow" as const }]
-                : []),
-            ],
+      const record: CleanupRecord = {
+        directory,
+        client,
+        createSettled: false,
+        cleanupEntered: false,
+        cleanup: undefined,
+      }
+      this.cleanupRecords.set(id, record)
+      // Watch the create separately from attempt.wait, so a late answer can still
+      // be cleaned up after cancellation and every rejection is observed.
+      const creation = client.session.create(
+        {
+          id,
+          title: "Permission review",
+          location: { directory },
+          model: {
+            id: modelID,
+            providerID,
+            ...(variant ? { variant } : {}),
           },
-          { signal: attempt.signal },
-        ),
+          permissions: [
+            { action: "*", resource: "*", effect: "deny" },
+            ...(pending.structured
+              ? [{ action: TOOL, resource: "*", effect: "allow" as const }]
+              : []),
+          ],
+        },
+        { signal: attempt.signal },
       )
-      if (created.id !== id || created.location.directory !== directory)
+      const markSettled = () => {
+        record.createSettled = true
+        // Cleanup that already ran may have seen a session that did not exist yet.
+        // Wait for an in-progress attempt to finish, then retry once.
+        if (!record.cleanupEntered) return
+        void (record.cleanup ?? Promise.resolve(false))
+          .catch(() => false)
+          .then(() => {
+            if (this.cleanupRecords.get(id) === record) return this.cleanupSession(id, record)
+          })
+          .catch(() => {})
+      }
+      creation.then(markSettled, markSettled)
+      const created = await attempt.wait(creation)
+      if (created.id !== id || !sameIsolationDirectory(created.location?.directory, directory))
         throw new Error("Reviewer session identity or isolation location does not match")
       const tries = pending.structured ? 3 : 2
       let fault = "no review turn completed"
@@ -866,57 +958,107 @@ export class V2ReviewerBackend {
       // Keep the tool guard until interruption and deletion have settled.
       const pending = this.sessions.get(id)
       if (pending) pending.closing = true
-      let cleanupConfirmed = !createIssued
-      let cleanupFault = "session remained readable"
+      const record = this.cleanupRecords.get(id)
       try {
-        if (createIssued) {
-          for (let retry = 0; retry < 2 && !cleanupConfirmed; retry++) {
-            try {
-              await client.session.interrupt(
-                { sessionID: id },
-                { signal: AbortSignal.timeout(2000) },
-              )
-              if (this.config.retainReviewSessions) cleanupConfirmed = true
-            } catch (error) {
-              cleanupFault = errorMark(error)
-              if (sessionGone(error)) cleanupConfirmed = true
-            }
-            if (!this.config.retainReviewSessions && !cleanupConfirmed) {
-              try {
-                await client.session.remove(
-                  { sessionID: id },
-                  { signal: AbortSignal.timeout(2000) },
-                )
-              } catch (error) {
-                // A lost response is not proof that deletion failed or succeeded.
-                cleanupFault = errorMark(error)
-              }
-              try {
-                await client.session.get({ sessionID: id }, { signal: AbortSignal.timeout(2000) })
-                cleanupFault = "session remained readable"
-              } catch (error) {
-                cleanupFault = errorMark(error)
-                cleanupConfirmed = sessionGone(error)
-              }
-            }
-          }
-          if (!cleanupConfirmed)
+        if (record) {
+          if (!(await this.cleanupSession(id, record)))
             // Cleanup uncertainty must override a provisional allow; the controller fails closed.
             // eslint-disable-next-line no-unsafe-finally
             throw new Error(
-              `Reviewer cleanup could not be confirmed; isolation guards remain active (${cleanupFault})`,
+              `Reviewer cleanup could not be confirmed; isolation guards remain active (${record.fault ?? "session remained readable"})`,
             )
         }
       } finally {
         // The attempt is finished. An unconfirmed session keeps its tool guard, but it
         // is no longer in-flight, so it cannot block the next review or pin a dead location.
         this.sessions.delete(id)
-        if (cleanupConfirmed || !createIssued) {
-          this.retained.delete(id)
-          if (owners.get(id) === this) owners.delete(id)
-        } else this.retained.add(id)
+        if (!record && owners.get(id) === this) owners.delete(id)
       }
     }
+  }
+
+  /** Cleanup for one session, coalesced across the review, late settlement, and disposal. */
+  private cleanupSession(
+    id: string,
+    record: CleanupRecord,
+    deadline = Date.now() + cleanupTiming.deadlineMs,
+  ): Promise<boolean> {
+    // A concurrent path already confirmed this session; never touch it again.
+    if (this.cleanupRecords.get(id) !== record) return Promise.resolve(true)
+    if (record.cleanup) return record.cleanup
+    record.cleanupEntered = true
+    const run = this.runCleanup(id, record, deadline)
+      .then((confirmed) => {
+        if (confirmed) this.confirmCleanup(id, record)
+        return confirmed
+      })
+      .finally(() => {
+        if (record.cleanup === run) record.cleanup = undefined
+      })
+    record.cleanup = run
+    return run
+  }
+
+  private confirmCleanup(id: string, record: CleanupRecord): void {
+    if (this.cleanupRecords.get(id) !== record) return
+    this.cleanupRecords.delete(id)
+    if (owners.get(id) === this) owners.delete(id)
+    // Routing forgets the session only now, so an uncertain cleanup never
+    // turns an owned ID into a project-host call.
+    releaseInProcessSession(record.client, id)
+    // Disposal may have finished while this cleanup was outstanding.
+    if (this.closing) void this.releaseLocation().catch(() => {})
+  }
+
+  private async runCleanup(id: string, record: CleanupRecord, deadline: number): Promise<boolean> {
+    const remaining = () => Math.max(0, deadline - Date.now())
+    const signal = () => AbortSignal.timeout(Math.max(1, remaining()))
+    const call = <T>(operation: Promise<T>) =>
+      bounded(operation, Math.min(cleanupTiming.attemptMs, Math.max(1, remaining())))
+    // Only a settled create makes a missing session proof of deletion. While the
+    // create is still in flight, the session may simply not exist yet.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) await delay(Math.min(cleanupTiming.retryDelayMs, remaining()))
+      if (remaining() <= 0) break
+      // An answer to a call issued before creation settled can already be stale.
+      const createSettled = record.createSettled
+      const gone = (error: unknown) => createSettled && sessionGone(error)
+      try {
+        await call(record.client.session.interrupt({ sessionID: id }, { signal: signal() }))
+        // A retained session is meant to stay readable; stopping it is enough.
+        // A create that has not settled may still create it after this review.
+        if (this.config.retainReviewSessions) {
+          if (createSettled) return true
+          record.fault = "the create call has not settled"
+          continue
+        }
+      } catch (error) {
+        if (gone(error)) return true
+        record.fault = record.createSettled ? errorMark(error) : "the create call has not settled"
+        if (this.config.retainReviewSessions) continue
+      }
+      if (this.config.retainReviewSessions) continue
+      try {
+        await call(record.client.session.remove({ sessionID: id }, { signal: signal() }))
+      } catch (error) {
+        // A lost response is not proof that deletion failed or succeeded.
+        record.fault = errorMark(error)
+      }
+      try {
+        const current = await call(
+          record.client.session.get({ sessionID: id }, { signal: signal() }),
+        )
+        const location = field(field(current, "location"), "directory")
+        record.fault =
+          typeof location === "string" && !sameIsolationDirectory(location, record.directory)
+            ? "session belongs to another location"
+            : "session remained readable"
+      } catch (error) {
+        record.fault = record.createSettled ? errorMark(error) : "the create call has not settled"
+        if (gone(error)) return true
+      }
+    }
+    return false
   }
 }
 

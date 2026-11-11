@@ -10,6 +10,7 @@ import {
   createInProcessReviewClient,
   forgetIsolationContext,
   noteIsolationContext,
+  releaseInProcessSession,
 } from "../src/opencode/v2/in-process-client.ts"
 import { connectReviewHost, setup } from "../src/opencode/v2/server.ts"
 import { decision } from "./helpers.ts"
@@ -326,6 +327,145 @@ test("a missing isolation context does not ask the host about an owned session",
     )
     await client.session.get({ sessionID: "ses_user" })
     expect(seen).toEqual(["host.create", "host.get"])
+  } finally {
+    forgetIsolationContext(directory)
+  }
+})
+
+test("cleanup reactivates a dropped isolation context and never uses the project host", async () => {
+  const directory = "/tmp/opencode-reviewer-isolation-reactivated"
+  const seen: string[] = []
+  const host = {
+    mcp: {
+      list: async (input: { location: { directory: string } }) => {
+        seen.push("host.mcp.list")
+        noteIsolationContext(directory, {
+          location: { directory },
+          plugin: { list: async () => ({ location: { directory }, data: [] }) },
+          model: { list: async () => ({ location: { directory }, data: [] }) },
+          session: {
+            interrupt: async () => void seen.push("isolation.interrupt"),
+            remove: async () => void seen.push("isolation.remove"),
+            get: async () => {
+              seen.push("isolation.get")
+              throw { _tag: "SessionNotFoundError" }
+            },
+          },
+        })
+        return { location: input.location, data: [] }
+      },
+    },
+    session: {
+      create: async (input: { id: string; location: { directory: string } }) => {
+        seen.push("host.create")
+        return { id: input.id, location: input.location }
+      },
+      interrupt: async () => void seen.push("host.interrupt"),
+      remove: async () => void seen.push("host.remove"),
+      get: async () => void seen.push("host.get"),
+    },
+  }
+  const client = createInProcessReviewClient(host as unknown as Context)
+  try {
+    await client.session.create({ id: "ses_review", location: { directory } })
+    forgetIsolationContext(directory)
+    await client.session.remove({ sessionID: "ses_review" })
+    await expect(client.session.get({ sessionID: "ses_review" })).rejects.toMatchObject({
+      _tag: "SessionNotFoundError",
+    })
+    await client.session.interrupt({ sessionID: "ses_review" })
+    expect(seen).toEqual([
+      "host.create",
+      "host.mcp.list",
+      "isolation.remove",
+      "isolation.get",
+      "isolation.interrupt",
+    ])
+  } finally {
+    forgetIsolationContext(directory)
+  }
+})
+
+test("a requested id stays owned while create is pending and another returned id is not adopted", async () => {
+  const directory = "/tmp/opencode-reviewer-isolation-pending"
+  const seen: string[] = []
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => (release = resolve))
+  noteIsolationContext(directory, {
+    location: { directory },
+    plugin: { list: async () => ({ location: { directory }, data: [] }) },
+    model: { list: async () => ({ location: { directory }, data: [] }) },
+    session: {
+      get: async ({ sessionID }: { sessionID: string }) => {
+        seen.push(`isolation:${sessionID}`)
+        throw { _tag: "SessionNotFoundError" }
+      },
+    },
+  })
+  const host = {
+    mcp: { list: async () => ({ data: [] }) },
+    session: {
+      create: async (input: { id: string; location: { directory: string } }) => {
+        seen.push("host.create")
+        await gate
+        return { id: "ses_unexpected", location: input.location }
+      },
+      get: async ({ sessionID }: { sessionID: string }) => {
+        seen.push(`host:${sessionID}`)
+        return { id: sessionID }
+      },
+    },
+  }
+  const client = createInProcessReviewClient(host as unknown as Context)
+  try {
+    const creation = client.session.create({ id: "ses_review", location: { directory } })
+    await expect(client.session.get({ sessionID: "ses_review" })).rejects.toMatchObject({
+      _tag: "SessionNotFoundError",
+    })
+    release()
+    expect((await creation).id).toBe("ses_unexpected")
+    await client.session.get({ sessionID: "ses_unexpected" })
+    expect(seen).toEqual(["host.create", "isolation:ses_review", "host:ses_unexpected"])
+  } finally {
+    release()
+    forgetIsolationContext(directory)
+  }
+})
+
+test("owned routes are not evicted and are released only when cleanup is confirmed", async () => {
+  const directory = "/tmp/opencode-reviewer-isolation-many"
+  const seen: string[] = []
+  noteIsolationContext(directory, {
+    location: { directory },
+    plugin: { list: async () => ({ location: { directory }, data: [] }) },
+    model: { list: async () => ({ location: { directory }, data: [] }) },
+    session: {
+      prompt: async ({ sessionID }: { sessionID: string }) => {
+        seen.push(`isolation:${sessionID}`)
+      },
+    },
+  })
+  const host = {
+    mcp: { list: async () => ({ data: [] }) },
+    session: {
+      create: async (input: { id: string; location: { directory: string } }) => ({
+        id: input.id,
+        location: input.location,
+      }),
+      prompt: async ({ sessionID }: { sessionID: string }) => {
+        seen.push(`host:${sessionID}`)
+      },
+    },
+  }
+  const client = createInProcessReviewClient(host as unknown as Context)
+  try {
+    for (let index = 0; index < 300; index++)
+      await client.session.create({ id: `ses_${index}`, location: { directory } })
+    await client.session.prompt({ sessionID: "ses_0", text: "review" })
+    await client.session.prompt({ sessionID: "ses_299", text: "review" })
+    releaseInProcessSession(client, "ses_0")
+    await client.session.prompt({ sessionID: "ses_0", text: "review" })
+    expect(seen).toEqual(["isolation:ses_0", "isolation:ses_299", "host:ses_0"])
   } finally {
     forgetIsolationContext(directory)
   }

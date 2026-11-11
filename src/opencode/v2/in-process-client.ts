@@ -24,6 +24,14 @@ export interface IsolationQueryContext {
 }
 
 const isolationContexts = new Map<string, IsolationQueryContext>()
+/** Only cleanup may boot a missing isolation context; prompt and wait still fail. */
+const CLEANUP_CALLS = new Set(["interrupt", "remove", "get"])
+const sessionReleases = new WeakMap<object, (sessionID: string) => void>()
+
+/** Forget an owned session only once its cleanup is confirmed. */
+export function releaseInProcessSession(client: OpenCodeClient, sessionID: string): void {
+  sessionReleases.get(client as unknown as object)?.(sessionID)
+}
 
 export function locationKey(directory: string): string {
   const resolved = resolve(directory)
@@ -130,12 +138,26 @@ export function createInProcessReviewClient(host: Context): OpenCodeClient {
     if (!Array.isArray(listed.data)) throw new Error("Reviewer model catalog is unavailable")
     return listed
   }
-  const sessionTarget = (name: string, sessionID: unknown): object => {
+  const sessionTarget = async (
+    name: string,
+    sessionID: unknown,
+    options: { signal?: AbortSignal } | undefined,
+  ): Promise<object> => {
     if (typeof sessionID !== "string") return host.session
     const directory = ownedSessions.get(sessionID)
     if (!directory) return host.session
-    const isolated = isolationContexts.get(locationKey(directory))?.session as
-      Record<string, unknown> | undefined
+    let context = isolationContexts.get(locationKey(directory))
+    // Cleanup recovers a context the host dropped by booting the same directory
+    // again. The project host cannot see an owned session, so it is never used.
+    if (!context && CLEANUP_CALLS.has(name)) {
+      await host.mcp.list({ location: { directory } }, options)
+      context = isolationContexts.get(locationKey(directory))
+    }
+    if (!context) throw new Error("Reviewer isolation session is not reachable")
+    const reported = context.location?.directory
+    if (reported && !sameIsolationDirectory(reported, directory))
+      throw new Error("Reviewer isolation session belongs to another location")
+    const isolated = context.session as Record<string, unknown> | undefined
     if (!isolated || typeof isolated[name] !== "function") {
       throw new Error("Reviewer isolation session is not reachable")
     }
@@ -144,14 +166,15 @@ export function createInProcessReviewClient(host: Context): OpenCodeClient {
   const sessionCall = (name: string) => {
     return async (...args: unknown[]) => {
       const input = args[0] as { sessionID?: unknown } | undefined
-      return method(sessionTarget(name, input?.sessionID), name)(...args)
+      const options = args[1] as { signal?: AbortSignal } | undefined
+      return method(await sessionTarget(name, input?.sessionID, options), name)(...args)
     }
   }
   const createSession = method<unknown[], { id?: unknown; location?: { directory?: unknown } }>(
     host.session,
     "create",
   )
-  return {
+  const client = {
     mcp: {
       list: method(host.mcp, "list"),
     },
@@ -163,13 +186,30 @@ export function createInProcessReviewClient(host: Context): OpenCodeClient {
     },
     session: {
       create: async (...args: unknown[]) => {
+        const input = args[0] as
+          | {
+              id?: unknown
+              location?: { directory?: unknown }
+            }
+          | undefined
+        const requestedID = typeof input?.id === "string" ? input.id : undefined
+        const requestedDirectory =
+          typeof input?.location?.directory === "string" ? input.location.directory : undefined
+        // The request names the session it wants. Register that before the host
+        // answers, so cleanup during a pending create still routes to the
+        // isolation context instead of the project host.
+        if (requestedID && requestedDirectory) ownedSessions.set(requestedID, requestedDirectory)
         const created = await createSession(...args)
-        const input = args[0] as { location?: { directory?: unknown } } | undefined
-        const directory = created?.location?.directory ?? input?.location?.directory
-        if (typeof created?.id === "string" && typeof directory === "string") {
-          if (ownedSessions.size >= 256) ownedSessions.delete(ownedSessions.keys().next().value!)
-          ownedSessions.set(created.id, directory)
-        }
+        // Adopt only the ID and directory this call asked for. A different ID is
+        // not ours to prompt or delete.
+        if (
+          requestedID &&
+          requestedDirectory &&
+          created?.id === requestedID &&
+          typeof created.location?.directory === "string" &&
+          sameIsolationDirectory(created.location.directory, requestedDirectory)
+        )
+          ownedSessions.set(requestedID, requestedDirectory)
         return created
       },
       get: sessionCall("get"),
@@ -180,4 +220,6 @@ export function createInProcessReviewClient(host: Context): OpenCodeClient {
       remove: sessionCall("remove"),
     },
   } as unknown as OpenCodeClient
+  sessionReleases.set(client, (sessionID) => void ownedSessions.delete(sessionID))
+  return client
 }
