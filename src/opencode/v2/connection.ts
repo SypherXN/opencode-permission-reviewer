@@ -12,6 +12,9 @@ interface ServiceEndpoint {
 }
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"])
+// A host bound to every interface registers the wildcard address, which names
+// no destination. Its loopback twin reaches the same local server.
+const WILDCARD_LOOPBACK: Record<string, string> = { "0.0.0.0": "127.0.0.1", "[::]": "[::1]" }
 
 export function validateHostEndpoint(url: string): URL {
   const endpoint = new URL(url)
@@ -83,7 +86,9 @@ async function readRegisteredService(version: string): Promise<ServiceEndpoint |
   if (typeof info.password !== "string" || info.password.length === 0)
     throw new Error("Reviewer service registration does not contain authentication")
   assertLiveProcess(info.pid as number)
-  const endpoint = validateHostEndpoint(info.url)
+  // Only the trusted local registration is normalized; explicit host URLs keep
+  // the strict loopback-or-HTTPS check, and the identity RPC still runs.
+  const endpoint = validateHostEndpoint(connectableServiceUrl(info.url))
   if (!LOOPBACK_HOSTS.has(endpoint.hostname))
     throw new Error("Reviewer registered service must use a loopback address")
   if (endpoint.pathname !== "/" || endpoint.search || endpoint.hash)
@@ -98,6 +103,15 @@ async function readRegisteredService(version: string): Promise<ServiceEndpoint |
 export async function registeredServiceIsSelf(version: string): Promise<boolean> {
   const endpoint = await readRegisteredService(version).catch(() => undefined)
   return endpoint?.pid === process.pid
+}
+
+function connectableServiceUrl(url: string): string {
+  if (!URL.canParse(url)) return url
+  const endpoint = new URL(url)
+  const loopback = WILDCARD_LOOPBACK[endpoint.hostname]
+  if (loopback === undefined) return url
+  endpoint.hostname = loopback
+  return endpoint.href
 }
 
 function makeClient(endpoint: ServiceEndpoint): OpenCodeClient {

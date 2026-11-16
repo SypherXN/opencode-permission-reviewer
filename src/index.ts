@@ -9,6 +9,7 @@ import { createAuditWriter } from "./audit.ts"
 import { setup } from "./opencode/v2/server.ts"
 import { withTimeout } from "./opencode/transport.ts"
 import { createHostDirectUsageClient } from "./system-one/direct-usage.ts"
+import { assertV1HostVersion } from "./opencode/host-guard.ts"
 
 export const server: Plugin = async (input, options) => {
   // V1 does not report whether plugin options came from global or project
@@ -38,6 +39,13 @@ export const server: Plugin = async (input, options) => {
         .then((response) => response.data?.version)
         .catch(() => undefined)
     : undefined
+  try {
+    assertV1HostVersion(hostVersion)
+  } catch (error) {
+    // Log even without debug: the host may only record a generic load failure.
+    debugLogger((error as Error).message)
+    throw error
+  }
   // Quartermaster's RPC bus is not part of the V1 plugin input. A host that
   // passes one anyway lets the reviewer report its own token counts, which the
   // host would otherwise file under the isolation project where no usage view
