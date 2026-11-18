@@ -24,6 +24,7 @@ import { satisfies } from "semver"
 import packageInfo from "../../../package.json"
 import { SUPPORTED_V2_RANGE } from "../host-guard.ts"
 import { ScriptAnalysisRegistry } from "../../verified-ssh-script.ts"
+import { oprDisabled, setSessionOff, setSessionOn } from "../../session-toggle.ts"
 
 type Context = Parameters<Plugin.Plugin["setup"]>[0]
 
@@ -137,6 +138,50 @@ export async function setupWithServices(
     snapshot: async () => ({ generation, revision, directory, reviews: [...statuses.values()] }),
   })
   registrations.push(rpc)
+  // Slash commands for the host's command list. The host passes the calling
+  // session, so the switch is per-chat and needs no shell, no CLI and no
+  // folder-wide entry. A host without the command API gets no commands.
+  const commands = (
+    ctx as {
+      command?: {
+        transform?: (
+          callback: (editor: {
+            add(definition: {
+              name: string
+              description?: string
+              execute: (input: { sessionID: string }) => Promise<void>
+            }): void
+          }) => void,
+        ) => Promise<{ dispose(): Promise<void> }>
+      }
+    }
+  ).command
+  if (commands?.transform) {
+    const switchFor = async (sessionID: string, off: boolean) => {
+      try {
+        if (off) await setSessionOff(sessionID, { reason: "command" })
+        else await setSessionOn(sessionID)
+        log(`OPR switched ${off ? "off" : "on"} for ${sessionID}`)
+      } catch (error) {
+        // A state file that cannot be written leaves the chat reviewed.
+        log(`OPR switch failed for ${sessionID}`, String(error))
+      }
+    }
+    registrations.push(
+      await commands.transform((editor) => {
+        editor.add({
+          name: "opr-off",
+          description: "Turn the permission reviewer off for this chat",
+          execute: ({ sessionID }) => switchFor(sessionID, true),
+        })
+        editor.add({
+          name: "opr-on",
+          description: "Turn the permission reviewer back on for this chat",
+          execute: ({ sessionID }) => switchFor(sessionID, false),
+        })
+      }),
+    )
+  }
   const publish = async (status: ReviewUiStatus) => {
     statuses.set(status.requestID, status)
     if (statuses.size > 256) {
@@ -194,6 +239,42 @@ export async function setupWithServices(
       input.message = disposed
         ? "Reviewer is shutting down"
         : "Reviewer host event connection is unavailable"
+      return
+    }
+    // A session the user switched off behaves like OpenCode without this
+    // plugin: the request keeps its `ask` for the human, with no reviewer
+    // model call and no fabricated decision. OPR's own deterministic gates,
+    // including the emergency brake, are part of OPR and do not run here.
+    // `opr off` without a session covers the whole directory, so the folder is
+    // part of the lookup.
+    const toggle = oprDisabled(input.sessionID, directory)
+    if (toggle.disabled) {
+      if (audit) {
+        const reviewID = randomUUID()
+        notify(() =>
+          audit({
+            schemaVersion: 3,
+            reviewID,
+            requestID: reviewID,
+            hostGeneration: "v2",
+            hostVersion: ctx.app.version,
+            generation,
+            directory,
+            sessionID: input.sessionID,
+            nativeAction: input.action,
+            permission: input.action,
+            // "escalate" is the record kind for a request left to the human.
+            outcome: "escalate",
+            reason: `OPR is off for this chat${
+              toggle.reason === undefined ? "" : `: ${toggle.reason}`
+            }`,
+            timestamp: new Date().toISOString(),
+            durationMs: 0,
+            application: "human-pending",
+            decisionSource: "session-disabled",
+          }),
+        )
+      }
       return
     }
     if (requests.size >= 32) {

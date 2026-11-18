@@ -4,6 +4,7 @@ import type { ColorInput } from "@opentui/core"
 import { createSignal, Show } from "solid-js"
 import { ReviewerRpc } from "./rpc.ts"
 import { ReviewProgress, ReviewResult, type ReviewTheme } from "./components.tsx"
+import { sessionDisabled, setSessionOff, setSessionOn } from "../session-toggle.ts"
 import { ReviewUiState } from "../ui-state.ts"
 import { decodeUiStatus, encodeUiStatus, type ReviewUiStatus } from "../ui-protocol.ts"
 
@@ -197,6 +198,98 @@ export async function setupTuiV2(ctx: Context): Promise<() => void> {
     }
   }
   void connect()
+  /** `/opr off|on|status` for the chat being viewed. It only writes the
+   *  per-session toggle file: it never approves, calls a model, or touches the
+   *  audit trail. Convenience, not a trust boundary. */
+  const runOpr = async (raw?: string): Promise<void> => {
+    const notify = (
+      variant: "info" | "success" | "warning" | "error",
+      title: string,
+      message: string,
+    ) => {
+      try {
+        ctx.ui.toast.show({ variant, title, message })
+      } catch {
+        /* A host without toasts must not fail the command. */
+      }
+    }
+    try {
+      const words = (raw ?? "")
+        .trim()
+        .replace(/^\/opr\b/i, "")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+      const action = words[0] ?? "status"
+      if (action !== "off" && action !== "on" && action !== "status")
+        return notify("warning", "Usage", "/opr off|on|status [--minutes <n>]")
+      const route = ctx.ui.router.current()
+      if (route.type !== "session")
+        return notify(
+          "warning",
+          "No active session",
+          "/opr acts on the chat you are viewing; open one first.",
+        )
+      const sessionID = route.sessionID
+      if (action === "status") {
+        const status = sessionDisabled(sessionID)
+        if (!status.disabled)
+          return notify("info", "OPR is on for this session", `Session ${sessionID} is reviewed.`)
+        const details = [
+          ...(status.reason === undefined ? [] : [`reason: ${status.reason}`]),
+          ...(status.until === undefined ? [] : [`until ${status.until}`]),
+        ].join(", ")
+        return notify(
+          "warning",
+          "OPR is off for this session",
+          details ? `Session ${sessionID} — ${details}` : `Session ${sessionID} is not reviewed.`,
+        )
+      }
+      if (action === "on") {
+        const changed = await setSessionOn(sessionID)
+        return notify(
+          "success",
+          changed ? "OPR on for this session" : "OPR was already on for this session",
+          `Session ${sessionID}.`,
+        )
+      }
+      const at = words.indexOf("--minutes")
+      const minutes = at === -1 ? undefined : Number(words[at + 1])
+      if (minutes !== undefined && (!Number.isInteger(minutes) || minutes < 1))
+        return notify("warning", "Invalid --minutes", "Use a positive whole number of minutes.")
+      const entry = await setSessionOff(sessionID, {
+        reason: "tui",
+        ...(minutes === undefined ? {} : { minutes }),
+      })
+      notify(
+        "success",
+        "OPR off for this session",
+        entry.until === undefined
+          ? `Session ${sessionID}. Requests go straight to OpenCode's own prompt.`
+          : `Session ${sessionID} until ${entry.until}.`,
+      )
+    } catch (error) {
+      notify("error", "OPR command failed", error instanceof Error ? error.message : String(error))
+    }
+  }
+  // The host keymap lives in the OpenCode runtime: an older host without layers
+  // keeps the overlay and loses only the command.
+  try {
+    if (typeof ctx.keymap?.layer === "function")
+      ctx.keymap.layer(() => ({
+        commands: [
+          {
+            id: "permission-reviewer.opr",
+            title: "OPR on/off/status",
+            group: "Permission reviewer",
+            slash: { name: "opr", arguments: true },
+            run: (input?: string) => runOpr(input),
+          },
+        ],
+      }))
+  } catch {
+    /* Registration is optional; never fail the overlay on an older host. */
+  }
   const slot = ctx.ui.slot({
     append: "app",
     render: () => {

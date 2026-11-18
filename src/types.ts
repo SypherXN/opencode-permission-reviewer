@@ -265,6 +265,7 @@ export type DecisionSource =
   | "system-one-reviewer"
   | "manual-superseded"
   | "failure-safe"
+  | "session-disabled"
 
 export interface ReviewAuditRecord {
   /**

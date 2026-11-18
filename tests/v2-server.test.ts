@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import type { OpenCodeClient, OpenCodeEvent } from "@opencode/client"
@@ -33,6 +33,7 @@ async function fixture(
   let reviews = 0
   let registrationDisposals = 0
   const toolHooks = new Map<string, (event: unknown) => void>()
+  const commands = new Map<string, (input: { sessionID: string }) => Promise<void>>()
   const registration = () => ({
     dispose: async () => {
       registrationDisposals++
@@ -51,6 +52,16 @@ async function fixture(
     tool: {
       hook: async (name: string, callback: (event: unknown) => void) => {
         toolHooks.set(name, callback)
+        return registration()
+      },
+    },
+    command: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({
+          add: (definition: { name: string; execute: (input: { sessionID: string }) => Promise<void> }) => {
+            commands.set(definition.name, definition.execute)
+          },
+        })
         return registration()
       },
     },
@@ -144,6 +155,8 @@ async function fixture(
       resume?.()
     },
     tool: (name: string, event: unknown) => toolHooks.get(name)?.(event),
+    commandNames: () => [...commands.keys()].sort(),
+    command: (name: string, sessionID: string) => commands.get(name)!({ sessionID }),
     dispose,
     records: async () =>
       (await readFile(auditPath, "utf8"))
@@ -186,7 +199,7 @@ test("server maps decisions without elevating existing allow or deny and reports
       })
       expect(await harness.rpc.identity()).toBeTruthy()
       await harness.dispose()
-      expect(harness.registrationDisposals()).toBe(4)
+      expect(harness.registrationDisposals()).toBe(5)
       expect((await harness.records())[0]?.application).toBe(
         kind === "escalate" ? "human-pending" : "evaluation-returned",
       )
@@ -196,6 +209,90 @@ test("server maps decisions without elevating existing allow or deny and reports
     } finally {
       await harness.cleanup()
     }
+  }
+})
+
+test("a session switched off leaves the request as ask, with no review", async () => {
+  const harness = await fixture()
+  const togglePath = join(harness.directory, "sessions.json")
+  const previous = process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH
+  process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH = togglePath
+  try {
+    await writeFile(
+      togglePath,
+      JSON.stringify({ version: 1, off: { ses_main: { reason: "pairing" } } }),
+    )
+    const input = harness.input()
+    await harness.evaluate(input)
+    // Off never decides anything: OpenCode's own prompt reaches the human.
+    expect(input.effect).toBe("ask")
+    expect(harness.reviews()).toBe(0)
+    await Bun.sleep(20)
+    const records = await harness.records()
+    expect(records).toHaveLength(1)
+    expect(records[0]).toMatchObject({
+      decisionSource: "session-disabled",
+      application: "human-pending",
+      outcome: "escalate",
+    })
+    expect(String(records[0]?.reason)).toContain("pairing")
+
+    // Another session keeps its normal review.
+    const other = harness.input("ses_other")
+    await harness.evaluate(other)
+    expect(other.effect).toBe("allow")
+    expect(harness.reviews()).toBe(1)
+  } finally {
+    if (previous === undefined) delete process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH
+    else process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH = previous
+    await harness.cleanup()
+  }
+})
+
+test("slash commands switch the calling chat only", async () => {
+  const harness = await fixture()
+  const statePath = join(harness.directory, "sessions.json")
+  const previous = process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH
+  process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH = statePath
+  try {
+    expect(harness.commandNames()).toEqual(["opr-off", "opr-on"])
+    await harness.command("opr-off", "ses_main")
+    const off = harness.input("ses_main")
+    await harness.evaluate(off)
+    expect(off.effect).toBe("ask")
+    expect(harness.reviews()).toBe(0)
+    // Another chat in the same folder keeps its reviewer.
+    const other = harness.input("ses_other")
+    await harness.evaluate(other)
+    expect(other.effect).toBe("allow")
+    await harness.command("opr-on", "ses_main")
+    const back = harness.input("ses_main")
+    await harness.evaluate(back)
+    expect(back.effect).toBe("allow")
+  } finally {
+    if (previous === undefined) delete process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH
+    else process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH = previous
+    await harness.cleanup()
+  }
+})
+
+test("a session switched off behaves like OpenCode without the plugin", async () => {
+  const harness = await fixture()
+  const togglePath = join(harness.directory, "sessions.json")
+  const previous = process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH
+  process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH = togglePath
+  try {
+    await writeFile(togglePath, JSON.stringify({ version: 1, off: { ses_main: {} } }))
+    // Root destruction is OPR's own brake, not a host rule. With OPR off the
+    // request stays `ask` like any other: the human decides.
+    const input = { ...harness.input(), metadata: { command: "rm -rf /" } }
+    await harness.evaluate(input)
+    expect(input.effect).toBe("ask")
+    expect(harness.reviews()).toBe(0)
+  } finally {
+    if (previous === undefined) delete process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH
+    else process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH = previous
+    await harness.cleanup()
   }
 })
 

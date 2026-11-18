@@ -1,6 +1,10 @@
 import { expect, test } from "bun:test"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { resolveReviewTheme, setupTuiV2, testRender } from "./tui-loader.ts"
 import { createUiStatus } from "../src/ui-protocol.ts"
+import { sessionDisabled, SESSION_TOGGLE_PATH_ENV } from "../src/session-toggle.ts"
 import { request } from "./helpers.ts"
 
 test("TUI resolves nested, flat, and unavailable host themes", () => {
@@ -256,4 +260,124 @@ test("TUI restores authoritative snapshots after disconnect and isolates routes,
     view.renderer.destroy()
   }
   expect(modeDepth).toBe(0)
+}, 10000)
+
+test("/opr command switches the session it is invoked from and never throws", async () => {
+  const directory = "/workspace/fixture"
+  const dir = mkdtempSync(join(tmpdir(), "reviewer-tui-opr-"))
+  const path = join(dir, "sessions.json")
+  const previous = process.env[SESSION_TOGGLE_PATH_ENV]
+  process.env[SESSION_TOGGLE_PATH_ENV] = path
+  type Toast = { variant?: string; title?: string; message: string }
+  const toasts: Toast[] = []
+  let sessionID: string | undefined = "ses_main"
+  type Command = {
+    slash?: { name: string; arguments?: boolean }
+    run(input?: string): Promise<void> | void
+  }
+  let command: Command | undefined
+  const ctx = {
+    location: { directory },
+    data: { session: { get: () => ({ location: { directory } }) } },
+    keymap: {
+      mode: { push: () => () => {} },
+      layer: (factory: () => unknown) => {
+        command = (factory() as { commands: Command[] }).commands[0]
+      },
+    },
+    ui: {
+      router: {
+        current: () =>
+          sessionID === undefined ? { type: "home" } : { type: "session", sessionID },
+      },
+      toast: { show: (value: Toast) => toasts.push(value) },
+      slot: () => () => {},
+    },
+    client: {
+      rpc: () => ({
+        snapshot: async () => ({ directory, generation: "generation", revision: 0, reviews: [] }),
+        events: {
+          subscribe: async function* () {},
+        },
+      }),
+    },
+  } as unknown as Parameters<typeof setupTuiV2>[0]
+  const dispose = await setupTuiV2(ctx)
+  try {
+    expect(command?.slash).toMatchObject({ name: "opr", arguments: true })
+    const run = (input: string) => command!.run(input)
+    const last = () => toasts.at(-1)!
+
+    await run("/opr status")
+    expect(last().title).toBe("OPR is on for this session")
+
+    await run("/opr off")
+    expect(last().title).toBe("OPR off for this session")
+    expect(sessionDisabled("ses_main")).toEqual({ disabled: true, reason: "tui" })
+
+    await run("/opr status")
+    expect(last().title).toBe("OPR is off for this session")
+    expect(last().message).toContain("reason: tui")
+
+    await run("/opr off --minutes 30")
+    const until = sessionDisabled("ses_main").until
+    expect(typeof until).toBe("string")
+    expect(Date.parse(until!)).toBeGreaterThan(Date.now())
+
+    await run("/opr on")
+    expect(last().title).toBe("OPR on for this session")
+    expect(sessionDisabled("ses_main")).toEqual({ disabled: false })
+
+    await run("/opr on")
+    expect(last().title).toBe("OPR was already on for this session")
+
+    await run("/opr off --minutes zero")
+    expect(last().title).toBe("Invalid --minutes")
+    expect(sessionDisabled("ses_main")).toEqual({ disabled: false })
+
+    sessionID = undefined
+    await run("/opr off")
+    expect(last().title).toBe("No active session")
+    expect(sessionDisabled("ses_main")).toEqual({ disabled: false })
+
+    // A write failure is reported, not thrown out of the command.
+    sessionID = "ses_main"
+    writeFileSync(join(dir, "blocker"), "not a directory")
+    process.env[SESSION_TOGGLE_PATH_ENV] = join(dir, "blocker", "sessions.json")
+    await run("/opr off")
+    expect(last()).toMatchObject({ variant: "error", title: "OPR command failed" })
+  } finally {
+    dispose()
+    if (previous === undefined) delete process.env[SESSION_TOGGLE_PATH_ENV]
+    else process.env[SESSION_TOGGLE_PATH_ENV] = previous
+    rmSync(dir, { recursive: true, force: true })
+  }
+}, 10000)
+
+test("TUI keeps the overlay on a host without keymap layers", async () => {
+  const directory = "/workspace/fixture"
+  const ctx = {
+    location: { directory },
+    data: { session: { get: () => ({ location: { directory } }) } },
+    keymap: { mode: { push: () => () => {} } },
+    ui: {
+      router: { current: () => ({ type: "home" }) },
+      toast: {
+        show: () => {
+          throw new Error("this host has no toasts either")
+        },
+      },
+      slot: () => () => {},
+    },
+    client: {
+      rpc: () => ({
+        snapshot: async () => ({ directory, generation: "generation", revision: 0, reviews: [] }),
+        events: {
+          subscribe: async function* () {},
+        },
+      }),
+    },
+  } as unknown as Parameters<typeof setupTuiV2>[0]
+  const dispose = await setupTuiV2(ctx)
+  dispose()
 }, 10000)

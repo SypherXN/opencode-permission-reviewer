@@ -8,6 +8,7 @@
  *   doctor               report versions, config sources, audit path, policy mode
  *   config print-effective   print the resolved config + effective policy hash
  *   audit report         summarize the JSONL audit trail
+ *   opr off|on|status    switch the reviewer off/on for one V2 chat session
  *
  * Backward compatible: invoked with no subcommand (or with a flag first), it
  * runs `explain` against stdin/`--event`, matching the original behavior.
@@ -36,6 +37,15 @@ import type { PermissionRequest, PermissionToolSource, ReviewerConfig } from "..
 import { includeEvidenceFile } from "../ssh-evidence.ts"
 import { renderVerifiedSshScriptCommand, VERIFIED_SCRIPT_LIMIT } from "../verified-ssh-script.ts"
 import { redactSecrets } from "../redact.ts"
+import {
+  readSessionToggle,
+  resolveSessionTogglePath,
+  sessionToggleActive,
+  setDirectoryOff,
+  setDirectoryOn,
+  setSessionOff,
+  setSessionOn,
+} from "../session-toggle.ts"
 
 // Guarded so importing the module (e.g. via the "./cli" export or in tests)
 // never triggers the CLI or kills the importing process; only a direct
@@ -64,6 +74,8 @@ export async function runCli(argv: string[]): Promise<number> {
         return await runConfig(rest)
       case "audit":
         return await runAudit(rest)
+      case "opr":
+        return await runOpr(rest)
       case "script":
         return await runScript(rest)
       default:
@@ -87,6 +99,10 @@ function usage(): string {
   opencode-permission-reviewer doctor [--project <dir>] [--json]
   opencode-permission-reviewer config print-effective [--project <dir>]
   opencode-permission-reviewer audit report [--path <file>] [--project <dir>] [--json]
+  opencode-permission-reviewer opr off [--session <ses_ID>] [--reason <text>] [--minutes <n>]
+  opencode-permission-reviewer opr on [--session <ses_ID>]
+  opencode-permission-reviewer opr status
+    Without --session, off/on apply to every chat in the current directory.
   opencode-permission-reviewer script command --file <path> --host <host> [--port <port>] [--shell bash|sh]`
 }
 
@@ -429,6 +445,86 @@ function printAuditHuman(s: AuditSummary): void {
       console.log(`    line ${m.lineNo}: missing ${m.missing.join(", ")}`)
     }
   }
+}
+
+// --- opr (per-session switch) -------------------------------------------------
+
+async function runOpr(argv: string[]): Promise<number> {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    options: {
+      session: { type: "string" },
+      reason: { type: "string" },
+      minutes: { type: "string" },
+      help: { type: "boolean", short: "h" },
+    },
+    strict: true,
+    allowPositionals: true,
+  })
+  const action = positionals[0]
+  if (
+    values.help ||
+    positionals.length !== 1 ||
+    (action !== "off" && action !== "on" && action !== "status")
+  ) {
+    console.error(`Usage: opr off [--session <ses_ID>] [--reason <text>] [--minutes <n>]
+       opr on [--session <ses_ID>]
+       opr status
+Without --session, off and on apply to every chat in the current directory.`)
+    return values.help ? 0 : 2
+  }
+  const path = resolveSessionTogglePath()
+  if (action === "status") {
+    const state = readSessionToggle(path)
+    console.log(`session toggles: ${path}`)
+    if (state === undefined) {
+      console.log("  (absent or unreadable; every session is on)")
+      return 0
+    }
+    const now = Date.now()
+    const directories = Object.entries(state.offDirectories)
+    if (directories.length === 0) console.log("  (no directories off)")
+    for (const [key, entry] of directories) {
+      const flag = sessionToggleActive(entry, now) ? "off" : "on (lapsed)"
+      const until = entry.until === undefined ? "" : ` until ${entry.until}`
+      const reason = entry.reason === undefined ? "" : ` — ${entry.reason}`
+      console.log(`  ${key}: ${flag}${until}${reason}`)
+    }
+    const entries = Object.entries(state.off)
+    if (entries.length === 0) console.log("  (no sessions off)")
+    for (const [sessionID, entry] of entries) {
+      const flag = sessionToggleActive(entry, now) ? "off" : "on (lapsed)"
+      const until = entry.until === undefined ? "" : ` until ${entry.until}`
+      const reason = entry.reason === undefined ? "" : ` — ${entry.reason}`
+      console.log(`  ${sessionID}: ${flag}${until}${reason}`)
+    }
+    return 0
+  }
+  const sessionID = values.session?.trim()
+  const scope = sessionID ?? `every chat in ${process.cwd()}`
+  if (action === "on") {
+    const removed = sessionID
+      ? await setSessionOn(sessionID, path)
+      : await setDirectoryOn(process.cwd(), path)
+    console.log(removed ? `opr on for ${scope}` : `opr already on for ${scope}`)
+    return 0
+  }
+  const minutes = values.minutes === undefined ? undefined : Number(values.minutes)
+  if (minutes !== undefined && (!Number.isInteger(minutes) || minutes < 1)) {
+    console.error("opr off: --minutes must be a positive integer")
+    return 2
+  }
+  const options = {
+    ...(values.reason === undefined ? {} : { reason: values.reason }),
+    ...(minutes === undefined ? {} : { minutes }),
+  }
+  const entry = sessionID
+    ? await setSessionOff(sessionID, options, path)
+    : await setDirectoryOff(process.cwd(), options, path)
+  console.log(
+    `opr off for ${scope}${entry.until === undefined ? "" : ` until ${entry.until}`}`,
+  )
+  return 0
 }
 
 // --- shared helpers ----------------------------------------------------------

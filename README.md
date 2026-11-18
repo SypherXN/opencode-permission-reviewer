@@ -820,6 +820,65 @@ binary, blocked, or truncated evidence) remains a reviewer decision.
 - UI status messages are versioned, request-scoped, bounded, and transported
   through OpenCode's own workspace TUI event channel.
 
+### Turning OPR off for a session or a project
+
+To send `ask` requests straight to OpenCode's own prompt, without a reviewer
+model call:
+
+```bash
+# Every chat in the current directory, including chats started later
+opencode-permission-reviewer opr off [--reason "why"] [--minutes 30]
+opencode-permission-reviewer opr on
+
+# One chat session
+opencode-permission-reviewer opr off --session ses_... [--reason "why"] [--minutes 30]
+opencode-permission-reviewer opr on --session ses_...
+
+opencode-permission-reviewer opr status
+```
+
+Without `--session`, `off` and `on` use the directory the CLI runs in, and the
+gate compares it with the directory the host reports for the request. The
+directory is a convenience for when the session ID is not at hand — for
+example inside a chat, where a `/opr off` command can only run the CLI. A
+session entry wins over a directory entry when both are live.
+
+While a session is off it behaves like OpenCode without this plugin: requests
+keep their `ask` and OpenCode's own prompt answers them. OPR makes no reviewer
+model call, and its own deterministic gates — including the emergency brake —
+do not run, so a session you switch off is no longer protected by them. It
+never auto-approves. The switch is read fresh for each V2 `permission.evaluate`
+(the V1 event path is unchanged), so it applies to the next request without a
+restart; new sessions are on. An optional `--minutes` sets an `until` after
+which the session lapses back to on.
+
+The state lives in `~/.local/share/opencode/permission-reviewer-sessions.json`
+(mode 0600, atomic replace), holding the session entries and the directory
+entries side by side. A missing, unreadable, malformed, or unknown-version file
+means everything is on.
+
+That file lives outside the workspace and belongs to you. An agent with shell
+access could try to write it (or run the CLI) to switch itself off; that write
+or command is itself a permission request OPR can deny, but OPR cannot prove
+who wrote the file. Treat the toggle as a convenience for your own sessions,
+not as a boundary against a hostile agent.
+
+In the V2 TUI, `/opr` does the same thing for the chat you are viewing, without
+needing its session ID: `/opr off`, `/opr off --minutes 30`, `/opr on`, and
+`/opr status` write the same state file from the TUI process. Like the CLI it
+affects V2 only — the V1 event path does not read it — and it is convenience,
+not a trust boundary: anything that can write the file, or reach the TUI's
+command endpoint, can switch a session off the same way. It never approves
+anything, never calls a model, and never writes the audit trail.
+
+V2 also registers `/opr-off` and `/opr-on` as plugin commands, so any client
+that lists the host's commands — OpenChamber, for example — can switch the chat
+it is showing without a session ID: the host passes the calling session to the
+command. A host without that API simply has no commands, and the CLI and TUI
+forms above still work. Running a client-side markdown template instead would
+only send a prompt to the agent, which is why this package registers the
+commands itself.
+
 ### Supply chain
 
 - **No code runs at install time.** The package declares no lifecycle
