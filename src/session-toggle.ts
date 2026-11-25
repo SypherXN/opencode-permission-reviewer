@@ -160,7 +160,16 @@ export function oprDisabled(
   now = Date.now(),
   path = resolveSessionTogglePath(),
 ): SessionToggleStatus {
-  const state = readSessionToggle(path)
+  return lookupSessionToggle(readSessionToggle(path), sessionID, directory, now)
+}
+
+/** Check one identity against an already-read snapshot of the toggle file. */
+export function lookupSessionToggle(
+  state: SessionToggleState | undefined,
+  sessionID: string,
+  directory?: string,
+  now = Date.now(),
+): SessionToggleStatus {
   if (state === undefined) return { disabled: false }
   if (Object.hasOwn(state.off, sessionID)) {
     const own = statusOf(state.off[sessionID], now)

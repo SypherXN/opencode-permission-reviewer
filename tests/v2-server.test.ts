@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import type { OpenCodeClient, OpenCodeEvent } from "@opencode/client"
 import { setupWithServices } from "../src/opencode/v2/server.ts"
 import { normalizeV2Permission } from "../src/opencode/v2/permission-codec.ts"
+import { SESSION_TOGGLE_PATH_ENV } from "../src/session-toggle.ts"
 import type { ReviewExecutionResult } from "../src/types.ts"
 import { config, decision } from "./helpers.ts"
 
@@ -17,10 +18,13 @@ async function fixture(
     connectionError?: boolean
     budget?: number
     hostVersion?: string
+    auxiliarySessionID?: string
+    beforeSessionGet?: (sessionID: string) => Promise<void>
   } = {},
 ) {
   const directory = await mkdtemp(join(tmpdir(), "reviewer-server-contract-"))
   const auditPath = join(directory, "audit.jsonl")
+  const togglePath = join(directory, "sessions.json")
   let evaluate!: (input: Input) => Promise<void>
   let rpc!: {
     identity(): Promise<string>
@@ -34,6 +38,17 @@ async function fixture(
   let registrationDisposals = 0
   const toolHooks = new Map<string, (event: unknown) => void>()
   const commands = new Map<string, (input: { sessionID: string }) => Promise<void>>()
+  const lookups: string[] = []
+  const sessions = new Map<
+    string,
+    { id?: string; parentID?: unknown; location?: { directory: string } } | null
+  >()
+  const sessionInfo = (sessionID: string) => {
+    const overrides = sessions.get(sessionID)
+    return overrides === null
+      ? null
+      : { id: sessionID, location: { directory }, time: { created: 1 }, ...overrides }
+  }
   const registration = () => ({
     dispose: async () => {
       registrationDisposals++
@@ -72,11 +87,11 @@ async function fixture(
       },
     },
     session: {
-      get: async ({ sessionID }: { sessionID: string }) => ({
-        id: sessionID,
-        location: { directory },
-        time: { created: 1 },
-      }),
+      get: async ({ sessionID }: { sessionID: string }) => {
+        lookups.push(sessionID)
+        if (options.beforeSessionGet) await options.beforeSessionGet(sessionID)
+        return sessionInfo(sessionID)
+      },
     },
     event: {
       subscribe: async function* ({ signal }: { signal: AbortSignal }) {
@@ -98,7 +113,7 @@ async function fixture(
   } as unknown as Parameters<typeof setupWithServices>[0]
   const client = {
     session: {
-      get: ctx.session.get,
+      get: async ({ sessionID }: { sessionID: string }) => sessionInfo(sessionID),
       context: async () => [
         { type: "user", id: "msg_user", text: "Run printf safe", time: { created: 2 } },
       ],
@@ -111,7 +126,7 @@ async function fixture(
       return client
     },
     createBackend: () => ({
-      owns: () => false,
+      owns: (sessionID) => sessionID === options.auxiliarySessionID,
       waitForIdle: async () => {},
       dispose: async () => {},
       review: async () => {
@@ -135,11 +150,16 @@ async function fixture(
     sessionID,
     effect: "ask",
   })
+  const previousTogglePath = process.env[SESSION_TOGGLE_PATH_ENV]
+  process.env[SESSION_TOGGLE_PATH_ENV] = togglePath
   return {
     evaluate: (value: Input) => evaluate(value),
     input,
     rpc,
     directory,
+    togglePath,
+    lookups,
+    sessions,
     reviews: () => reviews,
     registrationDisposals: () => registrationDisposals,
     endEvents: () => {
@@ -164,7 +184,12 @@ async function fixture(
         .split("\n")
         .map((line) => JSON.parse(line) as Record<string, unknown>),
     cleanup: async () => {
-      await dispose()
+      try {
+        await dispose()
+      } finally {
+        if (previousTogglePath === undefined) delete process.env[SESSION_TOGGLE_PATH_ENV]
+        else process.env[SESSION_TOGGLE_PATH_ENV] = previousTogglePath
+      }
       await rm(directory, { recursive: true, force: true })
     },
   }
@@ -214,12 +239,9 @@ test("server maps decisions without elevating existing allow or deny and reports
 
 test("a session switched off leaves the request as ask, with no review", async () => {
   const harness = await fixture()
-  const togglePath = join(harness.directory, "sessions.json")
-  const previous = process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH
-  process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH = togglePath
   try {
     await writeFile(
-      togglePath,
+      harness.togglePath,
       JSON.stringify({ version: 1, off: { ses_main: { reason: "pairing" } } }),
     )
     const input = harness.input()
@@ -243,46 +265,167 @@ test("a session switched off leaves the request as ask, with no review", async (
     expect(other.effect).toBe("allow")
     expect(harness.reviews()).toBe(1)
   } finally {
-    if (previous === undefined) delete process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH
-    else process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH = previous
     await harness.cleanup()
   }
 })
 
-test("slash commands switch the calling chat only", async () => {
+test("slash commands switch a chat and its native descendants, not unrelated chats", async () => {
   const harness = await fixture()
-  const statePath = join(harness.directory, "sessions.json")
-  const previous = process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH
-  process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH = statePath
   try {
+    harness.sessions.set("ses_child", { parentID: "ses_main" })
+    harness.sessions.set("ses_nested", { parentID: "ses_child" })
     expect(harness.commandNames()).toEqual(["opr-off", "opr-on"])
     await harness.command("opr-off", "ses_main")
     const off = harness.input("ses_main")
     await harness.evaluate(off)
     expect(off.effect).toBe("ask")
+    expect(harness.lookups).toEqual([])
+    for (const sessionID of ["ses_child", "ses_nested"]) {
+      const descendant = harness.input(sessionID)
+      await harness.evaluate(descendant)
+      expect(descendant.effect).toBe("ask")
+      expect(descendant.message).toBeUndefined()
+    }
     expect(harness.reviews()).toBe(0)
-    // Another chat in the same folder keeps its reviewer.
-    const other = harness.input("ses_other")
+    expect((await harness.rpc.snapshot()).reviews).toEqual([])
+    // A claimed parent in permission metadata cannot turn the reviewer off.
+    const other = {
+      ...harness.input("ses_other"),
+      metadata: { command: "printf safe", parentID: "ses_main" },
+    }
     await harness.evaluate(other)
     expect(other.effect).toBe("allow")
+    expect(harness.reviews()).toBe(1)
     await harness.command("opr-on", "ses_main")
-    const back = harness.input("ses_main")
+    const lookupsBefore = harness.lookups.length
+    const back = harness.input("ses_nested")
     await harness.evaluate(back)
     expect(back.effect).toBe("allow")
+    expect(harness.reviews()).toBe(2)
+    expect(harness.lookups.slice(lookupsBefore)).toEqual(["ses_nested"])
+    await harness.dispose()
+    const disabled = (await harness.records()).filter(
+      (record) => record.decisionSource === "session-disabled",
+    )
+    expect(disabled.map((record) => record.sessionID).sort()).toEqual([
+      "ses_child",
+      "ses_main",
+      "ses_nested",
+    ])
+    for (const record of disabled) {
+      expect(record).toMatchObject({ application: "human-pending", outcome: "escalate" })
+      expect(record.reason).toBe("OPR is off for this chat: command")
+    }
   } finally {
-    if (previous === undefined) delete process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH
-    else process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH = previous
     await harness.cleanup()
+  }
+})
+
+test("invalid native lineage and auxiliary sessions cannot inherit an off entry", async () => {
+  const harness = await fixture({ auxiliarySessionID: "ses_auxiliary" })
+  try {
+    await harness.command("opr-off", "ses_main")
+    for (const parent of [
+      null,
+      { id: "ses_wrong" },
+      { location: { directory: "/another-location" } },
+      { parentID: "ses_child" },
+      { parentID: "" },
+      { parentID: 42 },
+    ]) {
+      harness.sessions.set("ses_child", { parentID: "ses_main" })
+      harness.sessions.set("ses_main", parent)
+      const child = harness.input("ses_child")
+      await harness.evaluate(child)
+      expect(child.effect).toBe("allow")
+    }
+    harness.sessions.set("ses_main", {})
+    harness.sessions.set("ses_child", { id: "ses_wrong", parentID: "ses_main" })
+    const wrongChild = harness.input("ses_child")
+    await harness.evaluate(wrongChild)
+    expect(wrongChild.effect).toBe("allow")
+
+    harness.sessions.set("ses_auxiliary", { parentID: "ses_main" })
+    const auxiliary = harness.input("ses_auxiliary")
+    await harness.evaluate(auxiliary)
+    expect(auxiliary.effect).toBe("deny")
+    expect(auxiliary.message).toContain("Automatic reviewer sessions may not request")
+    expect(harness.reviews()).toBe(7)
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("ancestry that exceeds the configured depth cannot inherit even a nearer off entry", async () => {
+  const harness = await fixture()
+  try {
+    const { maxSessionDepth, maxParentSessions } = config()
+    const limit = Math.min(maxSessionDepth, maxParentSessions)
+    for (let index = 0; index <= limit; index++) {
+      harness.sessions.set(`ses_${index}`, { parentID: `ses_${index + 1}` })
+    }
+    await harness.command("opr-off", "ses_1")
+    const child = harness.input("ses_0")
+    await harness.evaluate(child)
+    expect(child.effect).toBe("allow")
+    expect(harness.lookups).toHaveLength(limit + 1)
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test("pending inheritance respects cancellation and a concurrent /opr-on", async () => {
+  for (const change of ["interrupt", "event-loss", "shutdown", "deadline", "on"] as const) {
+    let start!: () => void
+    let release!: () => void
+    const started = new Promise<void>((resolve) => {
+      start = resolve
+    })
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const harness = await fixture({
+      budget: change === "deadline" ? 50 : 5000,
+      beforeSessionGet: async (sessionID) => {
+        if (sessionID !== "ses_main") return
+        start()
+        await held
+      },
+    })
+    try {
+      harness.sessions.set("ses_child", { parentID: "ses_main" })
+      await harness.command("opr-off", "ses_main")
+      const child = harness.input("ses_child")
+      const work = harness.evaluate(child)
+      await Promise.race([started, work])
+      expect(await harness.rpc.status()).toMatchObject({ pending: 1 })
+      expect((await harness.rpc.snapshot()).reviews).toEqual([])
+      if (change === "interrupt") harness.event("ses_child")
+      if (change === "event-loss") harness.endEvents()
+      if (change === "shutdown") await harness.dispose()
+      if (change === "on") {
+        await harness.command("opr-on", "ses_main")
+        release()
+      }
+      await work
+      release()
+      expect(child.effect).toBe(change === "on" ? "allow" : "deny")
+      expect(harness.reviews()).toBe(change === "on" ? 1 : 0)
+      await harness.dispose()
+      expect((await harness.records()).map((record) => record.application)).toEqual([
+        change === "on" ? "evaluation-returned" : "cancelled",
+      ])
+    } finally {
+      release()
+      await harness.cleanup()
+    }
   }
 })
 
 test("a session switched off behaves like OpenCode without the plugin", async () => {
   const harness = await fixture()
-  const togglePath = join(harness.directory, "sessions.json")
-  const previous = process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH
-  process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH = togglePath
   try {
-    await writeFile(togglePath, JSON.stringify({ version: 1, off: { ses_main: {} } }))
+    await writeFile(harness.togglePath, JSON.stringify({ version: 1, off: { ses_main: {} } }))
     // Root destruction is OPR's own brake, not a host rule. With OPR off the
     // request stays `ask` like any other: the human decides.
     const input = { ...harness.input(), metadata: { command: "rm -rf /" } }
@@ -290,8 +433,6 @@ test("a session switched off behaves like OpenCode without the plugin", async ()
     expect(input.effect).toBe("ask")
     expect(harness.reviews()).toBe(0)
   } finally {
-    if (previous === undefined) delete process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH
-    else process.env.OPENCODE_PERMISSION_REVIEWER_SESSIONS_PATH = previous
     await harness.cleanup()
   }
 })

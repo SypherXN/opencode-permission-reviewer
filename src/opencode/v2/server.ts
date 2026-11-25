@@ -24,9 +24,17 @@ import { satisfies } from "semver"
 import packageInfo from "../../../package.json"
 import { SUPPORTED_V2_RANGE } from "../host-guard.ts"
 import { ScriptAnalysisRegistry } from "../../verified-ssh-script.ts"
-import { oprDisabled, setSessionOff, setSessionOn } from "../../session-toggle.ts"
+import {
+  lookupSessionToggle,
+  readSessionToggle,
+  sessionToggleActive,
+  setSessionOff,
+  setSessionOn,
+  type SessionToggleStatus,
+} from "../../session-toggle.ts"
 
 type Context = Parameters<Plugin.Plugin["setup"]>[0]
+type Session = Awaited<ReturnType<Context["session"]["get"]>>
 
 export async function setup(ctx: Context): Promise<() => Promise<void>> {
   return setupWithServices(ctx, {
@@ -139,8 +147,8 @@ export async function setupWithServices(
   })
   registrations.push(rpc)
   // Slash commands for the host's command list. The host passes the calling
-  // session, so the switch is per-chat and needs no shell, no CLI and no
-  // folder-wide entry. A host without the command API gets no commands.
+  // session, so the switch is scoped to its chat tree and needs no shell, CLI,
+  // or folder-wide entry. A host without the command API gets no commands.
   const commands = (
     ctx as {
       command?: {
@@ -232,6 +240,83 @@ export async function setupWithServices(
       eventStreamHealthy = false
       if (!disposed) for (const { attempt } of requests.values()) attempt.close("cancelled")
     })
+  const activeForLookup = (attempt: ReviewAttempt) =>
+    !disposed && eventStreamHealthy && attempt.active(generation)
+  const getSession = (sessionID: string, attempt: ReviewAttempt) => {
+    if (!activeForLookup(attempt)) throw new Error("Review is no longer active")
+    return attempt.wait(ctx.session.get({ sessionID }, { signal: attempt.signal }))
+  }
+  const checkedSession = async (sessionID: string, attempt: ReviewAttempt) => {
+    const session = await getSession(sessionID, attempt)
+    if (session?.location?.directory !== directory)
+      throw new Error("Permission belongs to another location")
+    return session
+  }
+  const verifiedAncestors = async (session: Session, sessionID: string, attempt: ReviewAttempt) => {
+    const seen = new Set([sessionID])
+    const ancestors: string[] = []
+    const limit = Math.min(config.maxSessionDepth, config.maxParentSessions)
+    // Validate through the root, even if a nearer ancestor has an off entry.
+    while (activeForLookup(attempt)) {
+      if (
+        session?.id !== sessionID ||
+        session.location?.directory !== directory ||
+        backend.owns(sessionID)
+      )
+        return
+      const parentID = session.parentID
+      if (parentID === undefined) return ancestors
+      if (
+        typeof parentID !== "string" ||
+        !parentID.startsWith("ses") ||
+        /\s/.test(parentID) ||
+        seen.has(parentID) ||
+        ancestors.length >= limit
+      )
+        return
+      seen.add(parentID)
+      ancestors.push(parentID)
+      sessionID = parentID
+      try {
+        session = await getSession(sessionID, attempt)
+      } catch {
+        // Parent lookup is optional; cancellation is checked before resuming review.
+        return
+      }
+    }
+  }
+  const auditDisabled = (
+    input: Parameters<typeof normalizeV2Permission>[0],
+    toggle: SessionToggleStatus,
+    attempt?: ReviewAttempt,
+  ) => {
+    if (!audit) return
+    const reviewID = attempt?.id ?? randomUUID()
+    const durationMs = attempt ? Date.now() - attempt.startedAt : 0
+    notify(() =>
+      audit({
+        schemaVersion: 3,
+        reviewID,
+        requestID: reviewID,
+        hostGeneration: "v2",
+        hostVersion: ctx.app.version,
+        generation,
+        directory,
+        sessionID: input.sessionID,
+        nativeAction: input.action,
+        permission: input.action,
+        // "escalate" is the record kind for a request left to the human.
+        outcome: "escalate",
+        reason: `OPR is off for this chat${
+          toggle.reason === undefined ? "" : `: ${toggle.reason}`
+        }`,
+        timestamp: new Date().toISOString(),
+        durationMs,
+        application: "human-pending",
+        decisionSource: "session-disabled",
+      }),
+    )
+  }
   const permissionRegistration = await ctx.permission.hook("evaluate", async (input) => {
     if (input.effect !== "ask") return
     if (disposed || !eventStreamHealthy) {
@@ -247,34 +332,11 @@ export async function setupWithServices(
     // including the emergency brake, are part of OPR and do not run here.
     // `opr off` without a session covers the whole directory, so the folder is
     // part of the lookup.
-    const toggle = oprDisabled(input.sessionID, directory)
+    const toggleState = readSessionToggle()
+    const toggleNow = Date.now()
+    const toggle = lookupSessionToggle(toggleState, input.sessionID, directory, toggleNow)
     if (toggle.disabled) {
-      if (audit) {
-        const reviewID = randomUUID()
-        notify(() =>
-          audit({
-            schemaVersion: 3,
-            reviewID,
-            requestID: reviewID,
-            hostGeneration: "v2",
-            hostVersion: ctx.app.version,
-            generation,
-            directory,
-            sessionID: input.sessionID,
-            nativeAction: input.action,
-            permission: input.action,
-            // "escalate" is the record kind for a request left to the human.
-            outcome: "escalate",
-            reason: `OPR is off for this chat${
-              toggle.reason === undefined ? "" : `: ${toggle.reason}`
-            }`,
-            timestamp: new Date().toISOString(),
-            durationMs: 0,
-            application: "human-pending",
-            decisionSource: "session-disabled",
-          }),
-        )
-      }
+      auditDisabled(input, toggle)
       return
     }
     if (requests.size >= 32) {
@@ -341,6 +403,31 @@ export async function setupWithServices(
           { reviewID: attempt.id, generation, directory, hostVersion: ctx.app.version },
           exact,
         )
+        let session: Session | undefined
+        if (
+          toggleState &&
+          !backend.owns(pending.sessionID) &&
+          Object.values(toggleState.off).some((entry) => sessionToggleActive(entry, toggleNow))
+        ) {
+          session = await checkedSession(pending.sessionID, attempt)
+          const ancestors = await verifiedAncestors(session, pending.sessionID, attempt)
+          if (ancestors?.length && !backend.owns(pending.sessionID)) {
+            if (snapshotAction() !== actionSnapshot)
+              throw new Error("Pending action changed during its review")
+            // /opr-on or expiry during the lookup must win over the initial snapshot.
+            const fresh = readSessionToggle()
+            const now = Date.now()
+            for (const ancestor of ancestors) {
+              const inherited = lookupSessionToggle(fresh, ancestor, undefined, now)
+              if (!inherited.disabled) continue
+              if (!activeForLookup(attempt)) break
+              auditDisabled(input, inherited, attempt)
+              attempt.close("finished")
+              return
+            }
+          }
+          if (!activeForLookup(attempt)) throw new Error("Review is no longer active")
+        }
         const request = normalized.request
         await publish(
           createUiStatus(request, "reviewing", {
@@ -349,9 +436,8 @@ export async function setupWithServices(
             timeoutMs: budget,
           }),
         )
-        const session = await attempt.wait(ctx.session.get({ sessionID: input.sessionID }))
-        if (session.location.directory !== directory)
-          throw new Error("Permission belongs to another location")
+        if (session === undefined) await checkedSession(pending.sessionID, attempt)
+        if (!activeForLookup(attempt)) throw new Error("Review is no longer active")
         const client = await attempt
           .wait(services.connect(directory, identity, ctx.app.version, attempt.signal))
           .catch((error: unknown) => {

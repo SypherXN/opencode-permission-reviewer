@@ -830,7 +830,7 @@ model call:
 opencode-permission-reviewer opr off [--reason "why"] [--minutes 30]
 opencode-permission-reviewer opr on
 
-# One chat session
+# One chat and its subagents in the same directory
 opencode-permission-reviewer opr off --session ses_... [--reason "why"] [--minutes 30]
 opencode-permission-reviewer opr on --session ses_...
 
@@ -849,8 +849,13 @@ model call, and its own deterministic gates — including the emergency brake �
 do not run, so a session you switch off is no longer protected by them. It
 never auto-approves. The switch is read fresh for each V2 `permission.evaluate`
 (the V1 event path is unchanged), so it applies to the next request without a
-restart; new sessions are on. An optional `--minutes` sets an `until` after
-which the session lapses back to on.
+restart. A subagent inherits an active off switch from a verified parent chat
+in the same directory. Unrelated chats are unaffected. Turning the parent
+back on removes that inherited setting, but does not clear any separate
+session or directory switch. An optional `--minutes` sets when a switch expires.
+Unlike a direct switch, inheritance needs a host lookup. If the reviewer is
+already at its concurrency limit, the request is denied rather than handed
+off without verifying the parent.
 
 The state lives in `~/.local/share/opencode/permission-reviewer-sessions.json`
 (mode 0600, atomic replace), holding the session entries and the directory
@@ -870,11 +875,14 @@ affects V2 only — the V1 event path does not read it — and it is convenience
 not a trust boundary: anything that can write the file, or reach the TUI's
 command endpoint, can switch a session off the same way. It never approves
 anything, never calls a model, and never writes the audit trail.
+The TUI status shows the current chat's own switch, not inherited state.
+To remove an inherited switch, run `/opr-on` in the chat that set it.
 
 V2 also registers `/opr-off` and `/opr-on` as plugin commands, so any client
 that lists the host's commands — OpenChamber, for example — can switch the chat
-it is showing without a session ID: the host passes the calling session to the
-command. A host without that API simply has no commands, and the CLI and TUI
+it is showing and its same-directory subagents without a session ID. The host
+passes the calling session to the command. A host without that API has no
+slash commands from this registration, and the CLI and TUI
 forms above still work. Running a client-side markdown template instead would
 only send a prompt to the agent, which is why this package registers the
 commands itself.
